@@ -1,7 +1,7 @@
 {
   "_note": "Arc mainnet. Paper until the CopyRouter is deployed and a day of paper signals has been compared with circletrenches.com labels.",
   "live": false,
-  "router": "",
+  "router": "0x2db8eA10A76d788b726EEd5858cc7A774188A169",
   "rpc": "https://rpc.mainnet.arc.io",
   "fallback_rpc": "https://rpc.mainnet.arc.io",
   "dexscreener_chain": "arc",

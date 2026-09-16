@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """Simulate CopyRouter buys and sells on Arc's real state, with nothing deployed or sent.
 
-  python tools/simulate_router.py <token> [<token> ...]   (paper config is fine; run from the repo root)
+  python tools/simulate_router.py <token> [<token> ...] [--fresh]
+  (uses config.json's deployed router; --fresh or no router simulates a new build instead)
 
 Why not `forge test`: USDC on Arc checks a native blocklist precompile (0x1800..0001) on
 every transfer, which Foundry's EVM does not implement, so no local fork can move USDC.
@@ -54,13 +55,21 @@ def probe_slot(token, fn):
 
 
 def main(tokens):
-    if not ART.exists():
+    tokens = [t for t in tokens if not t.startswith("--")]
+    if not ART.exists() and not bot.ROUTER:
         sys.exit("build the router first:  forge build --root contracts")
-    art = json.loads(ART.read_text())
-    ctor = art["bytecode"]["object"] + encode(["address", "address"], [bot.SWAP_ROUTER02, bot.POOL_MANAGER]).hex()
-    code = post("eth_call", [{"from": TRADER, "data": ctor}, "latest"]).get("result")
-    if not code or len(code) < 100:
-        sys.exit("could not obtain the router runtime code from the node")
+    global ROUTER
+    code = None
+    if bot.ROUTER and "--fresh" not in sys.argv:
+        ROUTER = bot.ROUTER.lower()  # the deployed router itself: no code override
+        print(f"simulating against the deployed router {bot.ROUTER}")
+    else:
+        art = json.loads(ART.read_text())
+        ctor = art["bytecode"]["object"] + encode(["address", "address"], [bot.SWAP_ROUTER02, bot.POOL_MANAGER]).hex()
+        code = post("eth_call", [{"from": TRADER, "data": ctor}, "latest"]).get("result")
+        if not code or len(code) < 100:
+            sys.exit("could not obtain the router runtime code from the node")
+        print("simulating a freshly built router (code override)")
     sel = lambda s: keccak(text=s)[:4]
     usdc_allow = probe_slot(bot.USDC, lambda s: (mapping_key(TRADER, s, ROUTER),
                                                  "0x" + (sel("allowance(address,address)") + encode(["address", "address"], [TRADER, ROUTER])).hex()))
@@ -79,7 +88,7 @@ def main(tokens):
             continue
         swap = lambda legs, amt, mn: "0x" + (sel(f"swap({bot.LEG_T}[],uint256,uint256,address)") + encode(
             [f"{bot.LEG_T}[]", "uint256", "uint256", "address"], [[bot.leg_tuple(l) for l in legs], amt, mn, TRADER])).hex()
-        ov = {TRADER: {"balance": hex(10_000 * 10**18)}, ROUTER: {"code": code},
+        ov = {TRADER: {"balance": hex(10_000 * 10**18)}, **({ROUTER: {"code": code}} if code else {}),
               bot.USDC: {"stateDiff": {mapping_key(TRADER, usdc_allow, ROUTER): "0x" + "f" * 64}}}
         q_buy = bot.quote_route(legs_buy, amount_in)
         r = post("eth_call", [{"from": TRADER, "to": ROUTER, "data": swap(legs_buy, amount_in, 1)}, "latest", ov])
