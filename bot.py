@@ -1,0 +1,2507 @@
+#!/usr/bin/env python3
+"""arc-copybot: copy fomo traders' new-token buys on Arc (chain 5042) with USDC.
+
+Arc differs from Robinhood Chain in ways that matter here:
+  - gas is paid in USDC from the SAME balance we trade with (native 18dp view and the
+    ERC-20 at 0x3600..0000 6dp view are one balance); a gas reserve is kept
+  - every fomo buy is a Relay fill: a Relay solver sends native USDC to Relay's router,
+    the token's last hop is router -> trader. Anything else inbound is an airdrop.
+  - planted buys are common (20% of tracked-wallet buys on launch day), so the Relay
+    check is mandatory and FAILS CLOSED: no verified answer, no buy
+  - cash is identified by address only (nine memecoins use the ticker "USDC")
+
+Usage:
+  python bot.py                 run (paper unless config.live = true)
+  python bot.py status          open/closed positions + PnL
+  python bot.py route <token>   dry-run route discovery + quote for one token
+  python bot.py payer <txhash>  Relay's record for a fill and the verdict
+  python bot.py holdings <addr> what a watched wallet holds right now
+  python bot.py sell <token|symbol> [pct]   sell an open position now (asks to confirm)
+  python bot.py adopt <token> <usd_spent>   register tokens the wallet holds but the bot lost track of
+"""
+
+import json
+import os
+import sys
+import threading
+import time
+from pathlib import Path
+
+import requests
+from eth_abi import decode, encode
+from eth_account import Account
+from eth_utils import keccak, to_checksum_address
+
+# BOT_HOME=<dir> runs the same code from another directory (own config.json,
+# wallets.json, .env, data/) — used for the parallel paper instance.
+ROOT = Path(os.environ.get("BOT_HOME") or Path(__file__).resolve().parent).expanduser().resolve()
+DATA = ROOT / "data"
+DATA.mkdir(exist_ok=True)
+
+# ---- Arc mainnet (chain 5042). Uniswap addresses from Uniswap's official deployment list
+# (github.com/Uniswap/contracts deployments/json/5042.json), each confirmed with eth_getCode
+# and cross-wired (QuoterV2.factory, SwapRouter02.factory, PositionManager.poolManager).
+CHAIN_ID = 5042
+USDC = "0x3600000000000000000000000000000000000000"      # ERC-20 view of native USDC, 6dp
+USDC_SYSTEM = "0xfffffffffffffffffffffffffffffffffffffffe"  # EIP-7708 log emitter for native USDC moves (18dp)
+EURC = "0xbef5f6d51cb62b58e6a8f77868681825c6fe21c1"
+QUOTER_V2 = "0x7dfd4f31be6814d2906bde155c3e1b146eac1468"
+V3_FACTORY = "0xf0db7b58379503491d857db50ac9ece64c653918"
+V4_QUOTER = "0x8dc178efb8111bb0973dd9d722ebeff267c98f94"
+POSITION_MANAGER = "0x6049c9a0e26405c0985f9e3685c87d0ae917f82b"
+SWAP_ROUTER02 = "0x53bf6b0684ec7ef91e1387da3d1a1769bc5a6f77"
+POOL_MANAGER = "0x8366a39CC670B4001A1121B8F6A443A643e40951"
+RELAY_ROUTER = "0xb92fe925dc43a0ecde6c8b1a2709c170ec4fff4f"
+ZERO = "0x0000000000000000000000000000000000000000"
+TRANSFER_TOPIC = "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef"
+FEE_TIERS = (100, 500, 3000, 10000)
+# cash by ADDRESS only: several memecoins on Arc are called "USDC"
+FUNDING_ADDRS = {USDC, USDC_SYSTEM, EURC, ZERO}
+MAX_UINT = 2**256 - 1
+USDC_DEC = 6
+
+LEG_T = "(uint8,bytes,(address,address,uint24,int24,address),bool)"
+SWAP_SIG = f"swap({LEG_T}[],uint256,uint256,address)"
+
+
+# ---------------------------------------------------------------- config / env
+
+def read_env():
+    env = {}
+    p = ROOT / ".env"
+    if p.exists():
+        for line in p.read_text().splitlines():
+            line = line.strip()
+            if line and not line.startswith("#") and "=" in line:
+                k, v = line.split("=", 1)
+                env[k.strip()] = v.strip()
+    env.update(os.environ)
+    return env
+
+
+ENV = read_env()
+CFG = json.loads((ROOT / "config.json").read_text())
+RPC_URL = ENV.get("RPC_URL") or CFG["rpc"]
+ROUTER = CFG.get("router") or ""
+SLIPPAGE = CFG.get("slippage_pct", 3) / 100
+BLOCKS_PER_S = CFG.get("blocks_per_second", 1.98)
+DEX_CHAIN = CFG.get("dexscreener_chain", "arc")
+
+
+def load_wallets():
+    raw = json.loads((ROOT / "wallets.json").read_text())
+    out = {}
+    for w in raw:
+        a = (w["address"] if isinstance(w, dict) else w).lower()
+        out[a] = (w.get("label") if isinstance(w, dict) else None) or a[:10]
+    return out
+
+
+WALLETS = load_wallets()  # lower addr -> label
+
+
+def log(msg):
+    print(time.strftime("%H:%M:%S"), msg, flush=True)
+
+
+def append_jsonl(name, rec):
+    with open(DATA / name, "a") as f:
+        f.write(json.dumps(rec) + "\n")
+
+
+# ---------------------------------------------------------------- JSON-RPC
+
+_s = requests.Session()
+_s.headers["User-Agent"] = "arc-copybot/0.1"
+
+
+FALLBACK_RPC = CFG.get("fallback_rpc") or CFG["rpc"]
+_rpc_health = {"fails": 0, "down_until": 0.0, "announced": 0.0}
+
+
+def rpc_url():
+    """Primary RPC, or the public fallback while the primary is marked down."""
+    if RPC_URL != FALLBACK_RPC and time.time() < _rpc_health["down_until"]:
+        return FALLBACK_RPC
+    return RPC_URL
+
+
+def _reconnect(reason):
+    """Drop every pooled keep-alive connection so the next request opens a new
+    TCP/TLS session — a reused connection can be pinned to a bad gateway node."""
+    global _s
+    try:
+        _s.close()
+    except Exception:
+        pass
+    _s = requests.Session()
+    _s.headers["User-Agent"] = "arc-copybot/0.1"
+    append_jsonl("rpc_events.jsonl", {"ts": time.time(), "event": "reconnect", "reason": reason})
+
+
+def _primary_failed(e):
+    """Count hard failures of the primary (403/401/5xx/connection errors);
+    after 3 in a row, route everything to the fallback for 60s."""
+    resp = getattr(e, "response", None)
+    code = getattr(resp, "status_code", 0) if resp is not None else 0
+    append_jsonl("rpc_events.jsonl", {"ts": time.time(), "event": "primary_error", "code": code,
+                                      "type": type(e).__name__})
+    if code in (401, 403) and time.time() - _rpc_health.get("reconnected", 0) > 5:
+        _rpc_health["reconnected"] = time.time()
+        _reconnect(f"http {code}")
+    if code == 429 or (resp is not None and code < 400):
+        return
+    _rpc_health["fails"] += 1
+    if resp is not None and time.time() - _rpc_health.get("body_logged", 0) > 120:
+        _rpc_health["body_logged"] = time.time()
+        try:
+            body = resp.text[:300].replace("\n", " ").strip() or "(empty body)"
+            hdrs = {k: v for k, v in resp.headers.items()
+                    if k.lower() in ("content-type", "server", "cf-ray", "x-alchemy-error", "www-authenticate",
+                                     "retry-after", "x-ratelimit-remaining")}
+        except Exception:
+            body, hdrs = "(unreadable)", {}
+        log(f"  [rpc] primary answered {code}: {body} | headers {hdrs}")
+    if _rpc_health["fails"] >= 3 and RPC_URL != FALLBACK_RPC:
+        # sticky: if the primary fails again soon after coming back, stay away longer (1m -> 5m -> 15m)
+        recent = time.time() - _rpc_health.get("last_down", 0) < 600
+        hold = min(_rpc_health.get("hold", 60) * 5, 900) if recent else 60
+        _rpc_health.update(down_until=time.time() + hold, hold=hold, last_down=time.time(), fails=0,
+                           episodes=_rpc_health.get("episodes", 0) + 1)
+        append_jsonl("rpc_events.jsonl", {"ts": time.time(), "event": "failover", "hold_s": hold})
+        if time.time() - _rpc_health["announced"] > 300:
+            _rpc_health["announced"] = time.time()
+            log(f"  [rpc] primary RPC failing ({code or type(e).__name__}), episode {_rpc_health['episodes']} — "
+                f"using the public RPC for {hold // 60} min")
+
+
+def rpc(method, params, retries=3, url=None):
+    for attempt in range(retries):
+        target = url or rpc_url()
+        try:
+            r = _s.post(target, json={"jsonrpc": "2.0", "id": 1, "method": method,
+                                      "params": params}, timeout=20)
+            r.raise_for_status()
+            body = r.json()
+            if "error" in body:
+                raise RuntimeError(f"{method}: {body['error']}")
+            if target == RPC_URL:
+                _rpc_health["fails"] = 0
+            return body["result"]
+        except (requests.RequestException, RuntimeError) as e:
+            resp = getattr(e, "response", None)
+            if isinstance(e, requests.RequestException) and target == RPC_URL and not url:
+                _primary_failed(e)
+                if rpc_url() != target:
+                    return rpc(method, params, retries=2)  # failover just engaged: finish on the fallback
+                if resp is not None and resp.status_code in (401, 403) and attempt < retries - 1:
+                    continue  # fresh connection now: retry at once
+            if attempt == retries - 1:
+                raise
+            time.sleep(2.0 if resp is not None and resp.status_code == 429 else 0.5 * (attempt + 1))
+
+
+_RATE_HINTS = ("rate limit", "request limit", "too many requests", "-32005", "-32007", "-32029", '"code": 429')
+
+
+def _rate_limited(err):
+    """A per-item refusal inside an HTTP 200 batch (QuickNode -32007, Arc's public node
+    -32005). It means "ask again in a moment", never "no result"."""
+    m = json.dumps(err).lower() if not isinstance(err, str) else err.lower()
+    return any(h in m for h in _RATE_HINTS)
+
+
+def _post_batch(payload, url=None, failover=True):
+    """POST a JSON-RPC batch and return {id: item}. Items refused for rate limiting are
+    resent on their own (up to 4 rounds, backing off), so a refusal never turns into a
+    missing answer. Transport errors go through the primary's failover like rpc()."""
+    target = url or rpc_url()
+    pending = {item["id"]: item for item in payload}
+    answers = {}
+    for rnd in range(5):
+        try:
+            r = _s.post(target, json=list(pending.values()), timeout=20)
+            if r.status_code == 429:
+                raise requests.HTTPError("429", response=r)
+            r.raise_for_status()
+            body = r.json()
+        except requests.RequestException as e:
+            resp = getattr(e, "response", None)
+            if resp is not None and resp.status_code == 429 and rnd < 4:
+                time.sleep(1.0 + rnd)
+                continue
+            if target == RPC_URL and failover and not url:
+                _primary_failed(e)
+                if rpc_url() != target:
+                    return _post_batch(list(pending.values()), failover=False) | answers
+            raise
+        if not isinstance(body, list):
+            if _rate_limited(body) and rnd < 4:
+                time.sleep(1.0 + rnd)
+                continue
+            raise RuntimeError(f"batch: {str(body)[:120]}")
+        if target == RPC_URL:
+            _rpc_health["fails"] = 0
+        retry = {}
+        for b in body:
+            if "error" in b and _rate_limited(b["error"]) and rnd < 4:
+                retry[b["id"]] = pending[b["id"]]
+            else:
+                answers[b["id"]] = b
+        # a node can also drop items silently; ask again for anything unanswered
+        for i, item in pending.items():
+            if i not in answers and i not in retry and rnd < 4:
+                retry[i] = item
+        if not retry:
+            break
+        pending = retry
+        time.sleep(1.0 + rnd)
+    return answers
+
+
+def rpc_batch(calls, url=None):
+    """One HTTP request for several JSON-RPC calls (public RPCs rate-limit per
+    request, so the whole poll tick costs one). Results in call order."""
+    if not CFG.get("rpc_batching", True):
+        return [rpc(m, p, url=url) for m, p in calls]
+    payload = [{"jsonrpc": "2.0", "id": i, "method": m, "params": p} for i, (m, p) in enumerate(calls)]
+    body = _post_batch(payload, url)
+    out = []
+    for i, (m, _p) in enumerate(calls):
+        b = body.get(i)
+        if b is None:
+            raise RuntimeError(f"{m}: no answer after retries")
+        if "error" in b:
+            raise RuntimeError(f"{m}: {b['error']}")
+        out.append(b["result"])
+    return out
+
+
+def rpc_batch_raw(calls, url=None):
+    """Like rpc_batch but returns the raw per-call answers ({"result":..} or {"error":..})
+    instead of raising on the first error — for probes where a revert IS the answer.
+    A call still refused after the retries comes back as {"error": {"rate_limited": true}}."""
+    payload = [{"jsonrpc": "2.0", "id": i, "method": m, "params": p} for i, (m, p) in enumerate(calls)]
+    body = _post_batch(payload, url)
+    return [body.get(i) or {"error": {"rate_limited": True}} for i in range(len(calls))]
+
+
+def selector(sig):
+    return keccak(text=sig)[:4]
+
+
+def calldata(sig, types, args):
+    return "0x" + (selector(sig) + encode(types, args)).hex()
+
+
+def addr(a):
+    return to_checksum_address(a)
+
+
+def call(to, sig, types, args, rets, block="latest"):
+    out = rpc("eth_call", [{"to": addr(to), "data": calldata(sig, types, args)}, block])
+    return decode(rets, bytes.fromhex(out[2:]))
+
+
+def call_batch(items, block="latest"):
+    """Many eth_calls in ONE HTTP request. items: [(to, sig, types, args, rets)];
+    returns decoded tuples, None where a call reverted (rate-limit refusals are retried,
+    never reported as None)."""
+    if not CFG.get("rpc_batching", True):
+        out = []
+        for to, sig, types, args, rets in items:
+            try:
+                out.append(call(to, sig, types, args, rets, block))
+            except Exception:
+                out.append(None)
+        return out
+    payload = [{"jsonrpc": "2.0", "id": i, "method": "eth_call",
+                "params": [{"to": addr(to), "data": calldata(sig, types, args)}, block]}
+               for i, (to, sig, types, args, rets) in enumerate(items)]
+    body = _post_batch(payload)
+    out = []
+    for i, (to, sig, types, args, rets) in enumerate(items):
+        b = body.get(i, {})
+        if "error" in b and _rate_limited(b["error"]):
+            raise RuntimeError("rate limited after retries")
+        try:
+            out.append(decode(rets, bytes.fromhex(b["result"][2:])) if b.get("result") else None)
+        except Exception:
+            out.append(None)
+    return out
+
+
+def balance_of(token, who, block="latest"):
+    return call(token, "balanceOf(address)", ["address"], [addr(who)], ["uint256"], block)[0]
+
+
+_code_cache = {}
+
+
+def is_contract(a):
+    """True for real contracts (pools, routers). EIP-7702 delegated accounts —
+    every fomo wallet — carry code too but are people; a token sent from one of
+    them is a transfer or a gift, never a fill, so they count as EOAs here."""
+    a = a.lower()
+    if a not in _code_cache:
+        code = rpc("eth_getCode", [a, "latest"]) or "0x"
+        _code_cache[a] = code != "0x" and not code.startswith("0xef0100")
+    return _code_cache[a]
+
+
+_block_ts = {}
+
+
+def block_time(block):
+    if block not in _block_ts:
+        for attempt in range(6):
+            blk = rpc("eth_getBlockByNumber", [hex(block), False])
+            if blk:
+                _block_ts[block] = int(blk["timestamp"], 16)
+                break
+            time.sleep(0.3)  # fresh block not yet visible on this node
+        else:
+            raise RuntimeError(f"block {block} not found")
+    return _block_ts[block]
+
+
+# ---------------------------------------------------------------- token metadata
+
+_META_FILE = DATA / "tokens.json"
+_meta = json.loads(_META_FILE.read_text()) if _META_FILE.exists() else {}
+
+
+def _decode_string(hexdata):
+    raw = bytes.fromhex(hexdata[2:])
+    if len(raw) == 32:
+        return raw.rstrip(b"\x00").decode("utf-8", "replace")
+    n = int.from_bytes(raw[32:64], "big")
+    return raw[64:64 + n].decode("utf-8", "replace")
+
+
+def token_meta(token):
+    t = token.lower()
+    if t not in _meta:
+        try:
+            sym = _decode_string(rpc("eth_call", [{"to": t, "data": "0x95d89b41"}, "latest"]))
+            dec = int(rpc("eth_call", [{"to": t, "data": "0x313ce567"}, "latest"]), 16)
+        except Exception:
+            sym, dec = t[:8], 18
+        try:
+            name = _decode_string(rpc("eth_call", [{"to": t, "data": "0x06fdde03"}, "latest"]))  # name()
+        except Exception:
+            name = ""
+        _meta[t] = {"symbol": sym, "decimals": dec, "name": name}
+        _META_FILE.write_text(json.dumps(_meta, indent=1))
+    return _meta[t]
+
+
+# ---------------------------------------------------------------- dexscreener
+
+_px_cache, _px_good = {}, {}
+PRICE_TTL = 15
+
+
+def dex_get(url):
+    for attempt in range(3):
+        r = _s.get(url, timeout=15)
+        if r.status_code == 429:
+            time.sleep(1 + attempt)
+            continue
+        r.raise_for_status()
+        return r.json()
+    raise requests.RequestException("dexscreener 429")
+
+
+def token_info(token, fresh=False):
+    """{price, liquidity, symbol, buys24, sells24, pairs} from the deepest
+    pair on this chain. Failures are never cached; last good value served."""
+    key = token.lower()
+    now = time.time()
+    if not fresh and key in _px_cache and now - _px_cache[key][0] < PRICE_TTL:
+        return _px_cache[key][1]
+    info = {"price": None, "liquidity": 0.0, "symbol": None, "buys24": 0, "sells24": 0, "pairs": []}
+    try:
+        pairs = [p for p in (dex_get(f"https://api.dexscreener.com/latest/dex/tokens/{token}")
+                             .get("pairs") or []) if p.get("chainId") == DEX_CHAIN]
+    except (requests.RequestException, ValueError):
+        return _px_good.get(key, info)
+    info["pairs"] = pairs
+    info["buys24"] = sum(((p.get("txns") or {}).get("h24") or {}).get("buys") or 0 for p in pairs)
+    info["sells24"] = sum(((p.get("txns") or {}).get("h24") or {}).get("sells") or 0 for p in pairs)
+    best = None
+    for p in pairs:
+        liq = (p.get("liquidity") or {}).get("usd") or 0
+        base, quote = p.get("baseToken", {}), p.get("quoteToken", {})
+        px, sym = None, None
+        if (base.get("address") or "").lower() == key:
+            px, sym = p.get("priceUsd"), base.get("symbol")
+        elif (quote.get("address") or "").lower() == key and p.get("priceUsd") and p.get("priceNative"):
+            sym = quote.get("symbol")
+            try:
+                px = float(p["priceUsd"]) / float(p["priceNative"])
+            except (ValueError, ZeroDivisionError):
+                px = None
+        if px is not None and (best is None or liq > best[0]):
+            best = (liq, float(px), sym)
+    if best:
+        info.update(liquidity=best[0], price=best[1], symbol=best[2])
+    _px_cache[key] = (now, info)
+    if info["price"] is not None:
+        _px_good[key] = info
+    return info
+
+
+def dex_pairs(token, label):
+    """Uniswap pairs of one version (v3/v4), deepest first: [(other, liq, pair_id)]."""
+    out = []
+    pairs = [p for p in token_info(token)["pairs"]
+             if p.get("dexId") == "uniswap" and (p.get("labels") or []) == [label]]
+    for p in sorted(pairs, key=lambda p: -((p.get("liquidity") or {}).get("usd") or 0)):
+        base, quote = p["baseToken"]["address"], p["quoteToken"]["address"]
+        other = quote if base.lower() == token.lower() else base
+        liq = (p.get("liquidity") or {}).get("usd") or 0
+        if liq >= 1000 and other.lower() not in {a.lower() for a, _, _ in out}:
+            out.append((other, liq, p["pairAddress"]))
+    return out
+
+
+def pair_age_minutes(info):
+    try:
+        created = max((p.get("pairCreatedAt") or 0) for p in info.get("pairs") or [])
+        return round((time.time() - created / 1000) / 60, 1) if created else None
+    except Exception:
+        return None
+
+
+def honeypot_reason(info):
+    b, s = info.get("buys24", 0), info.get("sells24", 0)
+    if b >= 10 and s == 0:
+        return f"0 sells vs {b} buys (honeypot signature)"
+    if b >= 30 and s > 0 and b / s > 25:
+        return f"buys/sells {b}/{s} (near-unsellable)"
+    return None
+
+
+# ---------------------------------------------------------------- routing (Uniswap V3 + V4)
+# Leg dicts: {"kind":0,"path":"0x.."}  v3 multihop
+#            {"kind":1,"key":{c0,c1,fee,tick,hooks},"zf":bool}  v4 single pool
+
+def encode_path(*hops):
+    out = b""
+    for h in hops:
+        out += h.to_bytes(3, "big") if isinstance(h, int) else bytes.fromhex(h[2:])
+    return "0x" + out.hex()
+
+
+def leg_tuple(leg):
+    if leg["kind"] == 0:
+        return (0, bytes.fromhex(leg["path"][2:]), (ZERO, ZERO, 0, 0, ZERO), False)
+    k = leg["key"]
+    return (1, b"", (addr(k["c0"]), addr(k["c1"]), k["fee"], k["tick"], addr(k["hooks"])), leg["zf"])
+
+
+def deepest_fees(token, quotes):
+    """{quote: (depth_usd, fee) or None} for several quote tokens at once:
+    one batch for all getPool lookups, one for the balances of pools that exist."""
+    combos = [(q, fee) for q, _p, _d in quotes for fee in FEE_TIERS]
+    pools = call_batch([(V3_FACTORY, "getPool(address,address,uint24)", ["address", "address", "uint24"],
+                         [addr(token), addr(q), fee], ["address"]) for q, fee in combos])
+    live = [(q, fee, r[0]) for (q, fee), r in zip(combos, pools) if r and int(r[0], 16) != 0]
+    bals = call_batch([(q, "balanceOf(address)", ["address"], [addr(pool)], ["uint256"]) for q, _f, pool in live]) if live else []
+    best = {q: None for q, _p, _d in quotes}
+    meta = {q: (p, d) for q, p, d in quotes}
+    for (q, fee, _pool), b in zip(live, bals):
+        if not b:
+            continue
+        price, dec = meta[q]
+        depth = b[0] / 10**dec * price
+        if best[q] is None or depth > best[q][0]:
+            best[q] = (depth, fee)
+    return best
+
+
+def deepest_fee(token, quote, qprice, qdec):
+    return deepest_fees(token, [(quote, qprice, qdec)])[quote]
+
+
+def quote_v3(path_hex, amount_in):
+    return call(QUOTER_V2, "quoteExactInput(bytes,uint256)", ["bytes", "uint256"],
+                [bytes.fromhex(path_hex[2:]), amount_in],
+                ["uint256", "uint160[]", "uint32[]", "uint256"])[0]
+
+
+def quote_v4(key, zf, amount_in):
+    t = "((address,address,uint24,int24,address),bool,uint128,bytes)"
+    return call(V4_QUOTER, f"quoteExactInputSingle({t})", [t],
+                [((addr(key["c0"]), addr(key["c1"]), key["fee"], key["tick"], addr(key["hooks"])),
+                  zf, amount_in, b"")], ["uint256", "uint256"])[0]
+
+
+def _quote_item(leg, amt):
+    if leg["kind"] == 0:
+        return (QUOTER_V2, "quoteExactInput(bytes,uint256)", ["bytes", "uint256"],
+                [bytes.fromhex(leg["path"][2:]), amt], ["uint256", "uint160[]", "uint32[]", "uint256"])
+    k = leg["key"]
+    t = "((address,address,uint24,int24,address),bool,uint128,bytes)"
+    return (V4_QUOTER, f"quoteExactInputSingle({t})", [t],
+            [((addr(k["c0"]), addr(k["c1"]), k["fee"], k["tick"], addr(k["hooks"])), leg["zf"], amt, b"")],
+            ["uint256", "uint256"])
+
+
+def quote_routes(legs, amounts):
+    """Quote several input amounts through the same legs; one batched RPC
+    round trip per leg instead of one call per amount per leg."""
+    amts = [int(a) for a in amounts]
+    for leg in legs:
+        res = call_batch([_quote_item(leg, a) for a in amts])
+        if any(r is None for r in res):
+            raise RuntimeError("quote reverted")
+        amts = [r[0] for r in res]
+    return amts
+
+
+def quote_route(legs, amount_in):
+    return quote_routes(legs, [amount_in])[0]
+
+
+V4_INIT_TOPIC = "0x" + keccak(text="Initialize(bytes32,address,address,uint24,int24,address,uint160,int24)").hex()
+_pool_key_cache = {}
+
+
+def _pair_created_ms(pool_id):
+    """dexscreener's pairCreatedAt for a pool id we have seen in a token_info() answer."""
+    pid = pool_id.lower()
+    for _ts, info in list(_px_cache.values()) + [(0, i) for i in _px_good.values()]:
+        for pr in info.get("pairs") or []:
+            if (pr.get("pairAddress") or "").lower() == pid and pr.get("pairCreatedAt"):
+                return pr["pairCreatedAt"]
+    return None
+
+
+def block_at_ts(ts):
+    """Block number at unix time `ts`, from the head and the chain's block rate, refined twice."""
+    head = int(rpc("eth_blockNumber", []), 16)
+    head_ts = block_time(head)
+    b = int(head - (head_ts - ts) * BLOCKS_PER_S)
+    for _ in range(2):
+        b = max(1, min(b, head))
+        err = ts - block_time(b)
+        if abs(err) < 2:
+            break
+        b = int(b + err * BLOCKS_PER_S)
+    return max(1, min(b, head))
+
+
+def logs_windowed(flt, from_b, to_b, span=None, url=None, newest_first=False, stop_when=None):
+    """eth_getLogs over a block range in windows the node accepts (Arc's public node caps a
+    query at 10,000 blocks even when it is address- and topic-filtered)."""
+    span = span or CFG.get("log_window_blocks", 5000)
+    url = url or FALLBACK_RPC
+    out = []
+    windows = [(lo, min(lo + span - 1, to_b)) for lo in range(from_b, to_b + 1, span)]
+    for lo, hi in (reversed(windows) if newest_first else windows):
+        got = rpc("eth_getLogs", [{**flt, "fromBlock": hex(lo), "toBlock": hex(hi)}], retries=3, url=url)
+        out.extend(got)
+        if stop_when and stop_when(got):
+            break
+    return out
+
+
+def v4_pool_key(pool_id):
+    """PoolKey for a V4 pool id. PositionManager.poolKeys knows pools whose liquidity went
+    through it; hook-launched pools (most of Arc's) are missing there, so fall back to the
+    PoolManager's Initialize event, which carries the full key. Arc's nodes cap log ranges,
+    so the search is anchored on dexscreener's pool creation time and widens outward."""
+    if pool_id in _pool_key_cache:
+        return _pool_key_cache[pool_id]
+    key = None
+    try:
+        c0, c1, fee, tick, hooks = call(POSITION_MANAGER, "poolKeys(bytes25)", ["bytes25"],
+                                        [bytes.fromhex(pool_id[2:52])],
+                                        ["address", "address", "uint24", "int24", "address"])
+        if int(c1, 16) != 0:
+            key = {"c0": c0, "c1": c1, "fee": fee, "tick": tick, "hooks": hooks}
+    except Exception:
+        pass
+    if key is None:
+        created = _pair_created_ms(pool_id)
+        if created:
+            try:
+                b = block_at_ts(created / 1000)
+                flt = {"address": POOL_MANAGER, "topics": [V4_INIT_TOPIC, pool_id]}
+                w = CFG.get("log_window_blocks", 5000)
+                for lo, hi in ((b - w // 2, b + w // 2), (b - 2 * w, b - w // 2 - 1), (b + w // 2 + 1, b + 2 * w)):
+                    logs = logs_windowed(flt, max(1, lo), hi)
+                    if logs:
+                        lg = logs[0]
+                        d = bytes.fromhex(lg["data"][2:])
+                        key = {"c0": "0x" + lg["topics"][2][-40:], "c1": "0x" + lg["topics"][3][-40:],
+                               "fee": int.from_bytes(d[0:32], "big"),
+                               "tick": int.from_bytes(d[32:64], "big", signed=True),
+                               "hooks": "0x" + d[64:96][-20:].hex()}
+                        break
+            except Exception as e:
+                log(f"  [warn] pool key lookup for {pool_id[:12]}.. failed: {str(e)[:80]}")
+    if key and int(key["c1"], 16) == 0:
+        key = None  # malformed
+    if key and int(key["c0"], 16) == 0:
+        key = None  # native-currency pool: none seen on Arc, and our router trades the ERC-20 view
+    if key is not None:
+        _pool_key_cache[pool_id] = key  # misses are retried next time (dexscreener may learn the pool)
+    return key
+
+
+def v3_prefix_to(target):
+    """Cheapest v3 legs USDC->target and target->USDC, or None."""
+    if target.lower() == USDC.lower():
+        return [], []
+    d = deepest_fee(target, USDC, 1.0, USDC_DEC)
+    if d and d[0] >= 1000:
+        return ([{"kind": 0, "path": encode_path(USDC, d[1], target)}],
+                [{"kind": 0, "path": encode_path(target, d[1], USDC)}])
+    return None
+
+
+def v4_direct(a, b):
+    """Deepest V4 pool between tokens a and b with a resolvable key ->
+    ({"key","zf_a_to_b","liq"}) or None."""
+    for other, liq, pid in dex_pairs(a, "v4"):
+        if other.lower() != b.lower():
+            continue
+        key = v4_pool_key(pid)
+        if key and a.lower() in (key["c0"].lower(), key["c1"].lower()):
+            return {"key": key, "zf": a.lower() == key["c0"].lower(), "liq": liq}
+    return None
+
+
+def prefix_to(target):
+    """Legs USDC->target and target->USDC: V3 first, otherwise a single V4 pool quoted in USDC."""
+    if target.lower() in (ZERO, USDC_SYSTEM):
+        return None
+    v3 = v3_prefix_to(target)
+    if v3 is not None:
+        return v3
+    d = v4_direct(target, USDC)
+    if d and d["liq"] >= 1000:
+        return ([{"kind": 1, "key": d["key"], "zf": not d["zf"]}],
+                [{"kind": 1, "key": d["key"], "zf": d["zf"]}])
+    return None
+
+
+def quote_check(legs_buy, legs_sell, amount_in):
+    """(amount_out, impact, round_trip) measured on-chain: impact = how much
+    worse our fill is than a $1 probe through the same route (independent of
+    dexscreener's lagging price); round_trip = selling the output straight back."""
+    probe_in = 10**USDC_DEC
+    out, probe_out = quote_routes(legs_buy, [amount_in, probe_in])
+    impact = 1 - (out / amount_in) / (probe_out / probe_in)
+    back = quote_route(legs_sell, out)
+    return out, impact, back / amount_in - 1
+
+
+def discover_route(token):
+    """Best USDC<->token route -> (legs_buy, legs_sell, desc, depth_usd).
+    Candidates: V3 USDC-direct, V3 through one intermediate, and the token's deepest V4
+    pools (with a V3 or V4 prefix from USDC to whatever the pool is quoted in). Arc's V4
+    pools mostly carry hooks; the V4 quoter executes them, so taxes show up in the quote."""
+    cands = []  # (depth, legs_buy, legs_sell, desc)
+
+    def v3(pb, ps, depth, desc):
+        cands.append((depth, [{"kind": 0, "path": pb}], [{"kind": 0, "path": ps}], desc))
+
+    d = deepest_fee(token, USDC, 1.0, USDC_DEC)
+    if d and d[0] >= 1000:
+        v3(encode_path(USDC, d[1], token), encode_path(token, d[1], USDC), d[0], f"v3 USDC direct fee {d[1]}")
+
+    if not cands:
+        skip = {USDC.lower(), token.lower(), ZERO, USDC_SYSTEM}
+        for inter, _liq, _pid in dex_pairs(token, "v3"):
+            if inter.lower() in skip:
+                continue
+            iprice = token_info(inter)["price"]
+            if not iprice:
+                continue
+            idec = token_meta(inter)["decimals"]
+            ti = deepest_fee(token, inter, iprice, idec)
+            if not ti or ti[0] < 1000:
+                continue
+            prefix = v3_prefix_to(inter)
+            if prefix is None:
+                continue
+            pre_buy, pre_sell = prefix
+            buy_path = pre_buy[0]["path"] + ti[1].to_bytes(3, "big").hex() + token[2:].lower()
+            sell_path = "0x" + token[2:].lower() + ti[1].to_bytes(3, "big").hex() + pre_sell[0]["path"][2:]
+            v3(buy_path, sell_path, ti[0], f"v3 via {inter[:10]}.. fee {ti[1]}")
+            break
+
+    for other, liq, pair_id in dex_pairs(token, "v4")[:3]:  # always compete with v3 by depth
+        if other.lower() in (ZERO, USDC_SYSTEM):
+            continue
+        key = v4_pool_key(pair_id)
+        if key is None or token.lower() not in (key["c0"].lower(), key["c1"].lower()):
+            continue
+        prefix = prefix_to(other)
+        if prefix is None:
+            continue
+        pre_buy, pre_sell = prefix
+        zf_buy = other.lower() == key["c0"].lower()
+        legs_buy = pre_buy + [{"kind": 1, "key": key, "zf": zf_buy}]
+        legs_sell = [{"kind": 1, "key": key, "zf": not zf_buy}] + pre_sell
+        hooked = f" (hook {key['hooks'][:8]}..)" if int(key["hooks"], 16) else ""
+        vs = "USDC" if other.lower() == USDC.lower() else other[:10] + ".."
+        cands.append((liq, legs_buy, legs_sell, f"v4 pool vs {vs}{hooked}"))
+        break
+
+    for depth, lb, ls, desc in sorted(cands, key=lambda c: -c[0]):
+        try:
+            # probe BOTH directions: a pool can quote buys yet revert every sell
+            # (one-sided liquidity, or a hook that blocks sells), and we must be able to get out
+            out = quote_route(lb, 5 * 10**USDC_DEC)
+            if out > 0 and quote_route(ls, out) > 0:
+                return lb, ls, desc, depth
+        except Exception:
+            continue
+    raise RuntimeError("no routable Uniswap liquidity")
+
+
+# ---------------------------------------------------------------- signing / sending
+
+class TxPending(Exception):
+    """A transaction was broadcast but its receipt could not be fetched in
+    time. The caller must NOT retry blindly: it may have been mined."""
+
+    def __init__(self, tx_hash):
+        super().__init__(f"tx {tx_hash} sent, receipt not seen yet")
+        self.tx_hash = tx_hash
+
+
+def wait_receipt(tx_hash, seconds=90):
+    """Poll for a receipt, tolerating transient RPC errors. None on timeout."""
+    deadline = time.time() + seconds
+    while time.time() < deadline:
+        try:
+            rec = rpc("eth_getTransactionReceipt", [tx_hash], retries=1)
+            if rec:
+                return rec
+        except Exception:
+            pass
+        time.sleep(0.3)
+    return None
+
+
+class Signer:
+    def __init__(self, key):
+        self.acct = Account.from_key(key)
+        self.address = self.acct.address
+        self.last_nonce = -1
+        self.last_sent_ts = None
+
+    def next_nonce(self):
+        # a load-balanced RPC can lag on "pending"; never reuse a nonce we sent
+        n = int(rpc("eth_getTransactionCount", [self.address, "pending"]), 16)
+        return max(n, self.last_nonce + 1)
+
+    def send(self, to, data, gas_mult=1.3):
+        tx = {"from": self.address, "to": addr(to), "data": data}
+        gas_hex, gp_hex, n_hex = rpc_batch([("eth_estimateGas", [tx]), ("eth_gasPrice", []),
+                                            ("eth_getTransactionCount", [self.address, "pending"])])
+        gas = int(gas_hex, 16)  # a revert surfaces here, before we pay
+        gp = int(gp_hex, 16)
+        nonce = max(int(n_hex, 16), self.last_nonce + 1)
+        signed = self.acct.sign_transaction({
+            "chainId": CHAIN_ID, "nonce": nonce, "to": addr(to), "data": data, "value": 0,
+            "gas": int(gas * gas_mult), "gasPrice": int(gp * 1.5)})
+        raw = signed.raw_transaction.hex()
+        h = "0x" + signed.hash.hex().removeprefix("0x")  # known before sending: lets us recover a lost response
+        self.last_sent_ts = time.time()
+        try:
+            rpc("eth_sendRawTransaction", ["0x" + raw.removeprefix("0x")], retries=1)
+        except Exception as e:
+            msg = str(e)
+            # The node may have accepted the tx even though our response was lost; a
+            # blind resend then fails with "nonce too low"/"already known". Check the
+            # hash we computed before declaring failure.
+            if any(k in msg for k in ("nonce too low", "already known", "already exists", "known transaction")) \
+                    or isinstance(e, requests.RequestException):
+                rec = wait_receipt(h, seconds=20)
+                if rec is not None:
+                    self.last_nonce = nonce
+                    if int(rec["status"], 16) != 1:
+                        raise RuntimeError(f"tx {h} reverted")
+                    return rec
+            if "nonce too low" in msg:
+                self.last_nonce = int(rpc("eth_getTransactionCount", [self.address, "latest"]), 16) - 1
+            raise
+        self.last_nonce = nonce
+        rec = wait_receipt(h)
+        if rec is None:
+            raise TxPending(h)
+        if int(rec["status"], 16) != 1:
+            raise RuntimeError(f"tx {h} reverted")
+        return rec
+
+
+SIGNER = None
+
+
+def ensure_allowance(token, amount):
+    cur = call(token, "allowance(address,address)", ["address", "address"],
+               [SIGNER.address, addr(ROUTER)], ["uint256"])[0]
+    # tokens decrement the allowance on spend, so a MAX approval never reads as
+    # MAX again: treat anything above 1e30 raw as "effectively unlimited"
+    need = min(amount, 10**30)
+    if cur < need:
+        SIGNER.send(token, calldata("approve(address,uint256)", ["address", "uint256"], [addr(ROUTER), MAX_UINT]))
+        log(f"  approved {token_meta(token)['symbol']} for router")
+
+
+def swap_tx(legs, amount_in, min_out):
+    data = calldata(SWAP_SIG, [f"{LEG_T}[]", "uint256", "uint256", "address"],
+                    [[leg_tuple(l) for l in legs], amount_in, min_out, SIGNER.address])
+    return SIGNER.send(ROUTER, data)
+
+
+def sell_simulates(token, legs_sell, raw):
+    """Dry-run a real sell of `raw` from our wallet (eth_estimateGas executes the
+    swap including token transfers, which the quoters do not) -> True/False."""
+    try:
+        q = quote_route(legs_sell, raw)
+        data = calldata(SWAP_SIG, [f"{LEG_T}[]", "uint256", "uint256", "address"],
+                        [[leg_tuple(l) for l in legs_sell], raw, int(q * 0.5), SIGNER.address])
+        rpc("eth_estimateGas", [{"from": SIGNER.address, "to": addr(ROUTER), "data": data}])
+        return True
+    except Exception:
+        return False
+
+
+def received(rec, token):
+    me = SIGNER.address.lower()
+    return sum(int(lg["data"], 16) for lg in rec["logs"]
+               if lg["address"].lower() == token.lower() and len(lg["topics"]) == 3
+               and lg["topics"][0] == TRANSFER_TOPIC and "0x" + lg["topics"][2][-40:] == me)
+
+
+# ---------------------------------------------------------------- who paid? (Relay)
+# fomo wallets are funded through Relay (relay.link): a fomo buy is a Relay request "take my
+# USDC on Solana, deliver token X to my wallet", submitted by Relay's solver keys (0xf70da978..
+# and friends — what this file used to call fomo's payer) and settled by Relay's router
+# (0xb92fe925..). Relay lets any user name any recipient, so a scammer can buy their own coin
+# INTO a famous wallet and the chain shows a fill identical to the trader's own (MEGADUCK into
+# runitbackghost was paid by CHkt9dz8..; PEZ into unipcs by PEZ's own deployer). The receipt
+# cannot tell them apart; Relay's public index names the paying `user`.
+
+RELAY = "https://api.relay.link/requests/v2"
+_relay_s = requests.Session()
+_relay_s.headers["User-Agent"] = "arc-copybot/0.1"
+
+
+def load_solana():
+    """evm wallet -> its paired Solana wallet (solana.json, built from the scanner's traders.json)."""
+    for f in (ROOT / "solana.json", Path(__file__).resolve().parent / "solana.json"):
+        try:
+            return {k.lower(): v for k, v in json.loads(f.read_text()).items()}
+        except Exception:
+            continue
+    return {}
+
+
+SOLANA = load_solana()
+
+
+def relay_lookup(tx, wallet):
+    """Relay's request for this fill, or None when Relay has not indexed it yet, cannot be
+    asked (rate limit, outage), or has no request for it. One transaction can carry several
+    requests: take the one whose recipient is this wallet."""
+    try:
+        r = _relay_s.get(RELAY, params={"hash": tx}, timeout=5)
+        if r.status_code != 200:
+            return None
+        reqs = r.json().get("requests") or []
+    except Exception:
+        return None
+    if not reqs:
+        return None
+    w = wallet.lower()
+    mine = [q for q in reqs if (q.get("recipient") or "").lower() == w]
+    q = mine[0] if mine else reqs[0]
+    data = q.get("data") or {}
+    dep = ((q.get("protocol") or {}).get("deposit") or {}).get("origin") or {}
+    in_txs = data.get("inTxs") or [{}]
+    return {"referrer": q.get("referrer"), "user": q.get("user") or "", "recipient": (q.get("recipient") or "").lower(),
+            "in_chain": in_txs[0].get("chainId"), "dep_chain": dep.get("chainId"), "depositor": dep.get("depositor"),
+            "app_fees": len(data.get("appFees") or []), "for_wallet": bool(mine)}
+
+
+SOLANA_CHAIN = 792703809  # Relay's chain id for Solana
+
+
+def relay_judge(rec, wallet):
+    """fomo: the trader really pressed buy. ALL of: the request names this wallet as
+    recipient, it is the fomo app's (referrer "fomo" and fomo's app fees attached), the
+    deposit came in on Solana, and the paying user (and depositor, when recorded) is this
+    wallet's paired Solana wallet. A Solana deposit must be signed by its depositor, so
+    that combination cannot be written by a third party; referrer, user and depositor on
+    their own are free parameters of the quote request.
+    planted: any other Relay request delivering a token into the wallet.
+    unverifiable: no paired Solana wallet on file for this trader (skip, never guess)."""
+    if rec is None:
+        return "unknown"
+    paired = SOLANA.get(wallet.lower())
+    if paired is None:
+        return "unverifiable"
+    ok = (rec["for_wallet"] and rec["referrer"] == "fomo" and rec["app_fees"] > 0
+          and rec["in_chain"] == SOLANA_CHAIN and rec["user"] == paired
+          and (rec["depositor"] in (None, paired)) and rec["dep_chain"] in (None, SOLANA_CHAIN))
+    return "fomo" if ok else "planted"
+
+
+def relay_verdict(tx, wallet, deadline):
+    """Poll Relay until `deadline` (epoch). {"funding", "payer", "referrer", "chain"}."""
+    while True:
+        rec = relay_lookup(tx, wallet)
+        if rec is not None:
+            return {"funding": relay_judge(rec, wallet), "payer": rec["user"], "referrer": rec["referrer"],
+                    "chain": rec["in_chain"]}
+        if time.time() + 0.4 > deadline:
+            return {"funding": "unknown", "payer": None, "referrer": None, "chain": None}
+        time.sleep(0.4)
+
+
+# ---------------------------------------------------------------- holder probe (blacklist honeypots)
+
+_INSUFFICIENT = ("exceeds balance", "insufficient", "0xe450d38c", "0xf4d678b8")  # OZ/Solady "not enough balance"
+DEAD = "0x000000000000000000000000000000000000dEaD"
+
+
+def _revert_reason(err):
+    m = err if isinstance(err, str) else json.dumps(err)
+    i = m.find("08c379a0")
+    if i >= 0:  # Error(string)
+        h = m[i + 8:]
+        try:
+            ln = int(h[64:128], 16)
+            return bytes.fromhex(h[128:128 + ln * 2]).decode(errors="replace")
+        except Exception:
+            pass
+    j = m.find("0x")
+    return m[j:j + 10] if j >= 0 else m[:40]
+
+
+def recent_holders(token, upto_block, exclude, lookback, count, min_age_blocks):
+    """Distinct recent recipients of `token` in the `lookback` blocks before `upto_block`,
+    newest first, as probe candidates. On Arc a fomo buyer receives the token from Relay's
+    router, not from the PoolManager, so every recipient is a candidate; holder_probe drops
+    the contracts. Recipients younger than `min_age_blocks` are left out: a blacklisting
+    operator has not processed them yet, so they prove nothing."""
+    logs = rpc("eth_getLogs", [{"fromBlock": hex(max(0, upto_block - lookback)), "toBlock": hex(upto_block),
+                                "address": token, "topics": [TRANSFER_TOPIC]}], retries=2, url=FALLBACK_RPC)
+    out = []
+    for lg in reversed(logs):
+        if len(lg["topics"]) != 3:
+            continue
+        who = "0x" + lg["topics"][2][-40:]
+        if who in exclude or who in out or upto_block - int(lg["blockNumber"], 16) < min_age_blocks:
+            continue
+        out.append(who)
+        if len(out) >= count * 3:  # contracts are filtered later; fetch spares
+            break
+    return out
+
+
+def holder_probe(token, signal_wallet, signal_block):
+    """Blacklist honeypots (MEGADUCK, the PEZ family): the owner's bot marks every buyer
+    'Blocked: cannot sell' within about a minute of their buy. At the moment a signal arrives
+    the earlier buyers are therefore already trapped, while the signal wallet — and we, a
+    second later — can still sell for another minute; that is why the buy-time sell
+    simulation passes and the +5 min sell reverts. So ask the chain whether the last few
+    holders can still move 1 wei of the token (to the pool and to a plain address).
+    Returns {"probed", "ok", "trapped", "pool_blocked", "reasons"} or {"error": ..}."""
+    exclude = {signal_wallet.lower(), ZERO, POOL_MANAGER.lower(), DEAD.lower(), (ROUTER or "").lower(), RELAY_ROUTER,
+               SIGNER.address.lower() if SIGNER else ""}
+    count = CFG.get("holder_probe_count", 5)
+    min_age = int(CFG.get("holder_probe_min_age_s", 30) * BLOCKS_PER_S)
+    try:
+        try:
+            holders = recent_holders(token, signal_block, exclude, CFG.get("holder_probe_lookback_blocks", 6000),
+                                     count, min_age)
+        except Exception:
+            holders = recent_holders(token, signal_block, exclude, 1500, count, min_age)  # busy token: shorter window
+        if len(holders) < 2:
+            holders = recent_holders(token, signal_block, exclude, 30000, count, min_age)
+    except Exception as e:
+        return {"error": f"holders: {str(e)[:70]}"}
+    if not holders:
+        return {"probed": 0, "ok": 0, "trapped": 0, "pool_blocked": 0, "contracts": 0, "reasons": []}
+
+    def bal_call(h):
+        return ("eth_call", [{"to": addr(token), "data": "0x70a08231" + h[2:].rjust(64, "0")}, "latest"])
+
+    # stage 1: keep people who still hold the token. On Arc most recipients are pass-through
+    # accounts on a Relay route (they forward the token in the same tx and hold nothing), and
+    # arb bots are contracts; neither says anything about whether holders can sell.
+    try:
+        raw1 = rpc_batch_raw([bal_call(h) for h in holders] + [("eth_getCode", [addr(h), "latest"]) for h in holders])
+    except Exception as e:
+        return {"error": f"holders: {str(e)[:70]}"}
+    n1 = len(holders)
+    res = {"probed": 0, "ok": 0, "trapped": 0, "pool_blocked": 0, "contracts": 0, "empty": 0, "unknown": 0, "reasons": []}
+    chosen = []
+    for i, h in enumerate(holders):
+        code_item, bal_item = raw1[n1 + i], raw1[i]
+        if "error" in code_item or "error" in bal_item:
+            res["unknown"] += 1
+            continue
+        code = (code_item.get("result") or "0x").lower()
+        if code not in ("0x", "") and not code.startswith("0xef0100"):  # a contract (7702 wallets are people)
+            res["contracts"] += 1
+            continue
+        bal = int(bal_item.get("result") or "0x0", 16) if (bal_item.get("result") or "0x") != "0x" else 0
+        if bal == 0:
+            res["empty"] += 1
+            continue
+        chosen.append((h, bal))
+        if len(chosen) >= count:
+            break
+    if not chosen:
+        return res
+    n = len(chosen)
+
+    def xfer(to):
+        return "0xa9059cbb" + to[2:].lower().rjust(64, "0") + "1".rjust(64, "0")
+
+    # stage 2: can each still move 1 wei to the pool and to a plain address?
+    calls = [("eth_call", [{"from": addr(h), "to": addr(token), "data": xfer(POOL_MANAGER)}, "latest"]) for h, _b in chosen]
+    calls += [("eth_call", [{"from": addr(h), "to": addr(token), "data": xfer(DEAD)}, "latest"]) for h, _b in chosen]
+    # the signal wallet bought seconds ago and is not blacklisted yet: it tells a token-wide
+    # transfer rule (everyone fails the same way) apart from a blacklist (only old holders fail)
+    sw = signal_wallet
+    calls += [("eth_call", [{"from": addr(sw), "to": addr(token), "data": xfer(DEAD)}, "latest"]), bal_call(sw)]
+    try:
+        raw = rpc_batch_raw(calls)
+    except Exception as e:
+        return {"error": f"probe: {str(e)[:70]}"}
+
+    def verdict(r, bal):
+        if "result" in r and r.get("result") is not None:
+            return "ok"
+        if _rate_limited(r.get("error", "")):
+            return "unknown"  # a refusal is not an answer
+        m = json.dumps(r.get("error", "")).lower()
+        if bal == 0 or any(k in m for k in _INSUFFICIENT):
+            return "nobal"  # sold already or dust: proves nothing
+        return _revert_reason(m)
+
+    for i, (h, bal) in enumerate(chosen):
+        pool, plain = verdict(raw[i], bal), verdict(raw[n + i], bal)
+        if "unknown" in (pool, plain):
+            res["unknown"] += 1
+            continue
+        res["probed"] += 1
+        if plain == "ok" and pool == "ok":
+            res["ok"] += 1
+        elif plain not in ("ok", "nobal"):  # cannot move the token at all: blacklisted
+            res["trapped"] += 1
+            res["reasons"].append(plain)
+        elif pool not in ("ok", "nobal"):  # can transfer, cannot hand it to the pool
+            res["pool_blocked"] += 1
+            res["reasons"].append("pool: " + pool)
+    res["reasons"] = sorted(set(res["reasons"]))[:3]
+    b = raw[2 * n + 1].get("result")
+    res["signal"] = verdict(raw[2 * n], int(b, 16) if b and b != "0x" else 0)
+    if res["trapped"] and res["signal"] in res["reasons"] and res["signal"].startswith("0x"):
+        # the fresh buyer trips the same bare custom error as the old holders: a token-wide
+        # rule on direct transfers (RIP: sells through the router worked fine), not a blacklist
+        res.update(note="token-wide transfer rule", trapped_raw=res["trapped"], trapped=0)
+    return res
+
+
+def bytecode_reason(token):
+    """The 'Blocked: cannot sell' family (PEZ, PENZ, PEZZED, PEZZEL, ZEP, MEGADUCK, RIP) ships the
+    same ~8.7KB contract with one hard-coded address constant in it, seen in 7 of 7 of those
+    tokens and in 0 of the other 603 tokens the bots have traded. One getCode, no latency
+    (runs in the probe thread). Operators can rebuild without it, so this is the cheap second
+    layer behind holder_probe, not the main defense."""
+    marks = [m.lower().replace("0x", "") for m in CFG.get("bytecode_blocklist", [])]
+    if not marks:
+        return None
+    try:
+        code = rpc("eth_getCode", [addr(token), "latest"], retries=2).lower()
+    except Exception:
+        return None
+    for m in marks:
+        if m and m in code:
+            return f"token bytecode carries the honeypot family's constant 0x{m[:8]}.. (PEZ/MEGADUCK build)"
+    return None
+
+
+def holder_probe_reason(probe):
+    """Skip reason if the probe says the token is trapping its holders, else None."""
+    if not probe or probe.get("error") or not probe.get("probed"):
+        return None
+    trapped = probe["trapped"] + (probe["pool_blocked"] if CFG.get("holder_probe_pool_counts", False) else 0)
+    if trapped >= CFG.get("holder_probe_min_trapped", 2) or (trapped >= 1 and probe["ok"] == 0):
+        why = probe["reasons"][0] if probe["reasons"] else "revert"
+        return f"{trapped} of the last {probe['probed']} buyers can no longer sell (\"{why}\") — blacklist honeypot"
+    return None
+
+
+# ---------------------------------------------------------------- state
+
+STATE_FILE = DATA / "state.json"
+STATE = {"positions": {}, "closed": [], "last_block": 0}
+if STATE_FILE.exists():
+    STATE.update(json.loads(STATE_FILE.read_text()))
+
+
+def save_state():
+    tmp = STATE_FILE.with_suffix(".tmp")
+    tmp.write_text(json.dumps(STATE, indent=1))
+    os.replace(tmp, STATE_FILE)
+
+
+# ---------------------------------------------------------------- watching
+
+def pad(a):
+    return "0x" + a[2:].lower().rjust(64, "0")
+
+
+_SIZE_HINTS = ("limit", "range", "too large", "too many", "response size", "-32005",
+               "internal server")  # public RPC answers big ranges with a bare internal error
+
+
+def get_logs(topics, from_b, to_b):
+    params = {"fromBlock": hex(from_b), "toBlock": hex(to_b), "topics": topics}
+    try:
+        return rpc("eth_getLogs", [params], retries=2)
+    except (RuntimeError, requests.HTTPError) as e:
+        if "429" in str(e) or not any(h in str(e).lower() for h in _SIZE_HINTS) or to_b - from_b < 4:
+            raise
+        mid = (from_b + to_b) // 2
+        return get_logs(topics, from_b, mid) + get_logs(topics, mid + 1, to_b)
+
+
+def transfer_logs(from_b, to_b):
+    wl = [pad(a) for a in WALLETS]
+    logs = get_logs([TRANSFER_TOPIC, wl], from_b, to_b) + get_logs([TRANSFER_TOPIC, None, wl], from_b, to_b)
+    seen, out = set(), []
+    for lg in logs:
+        k = (lg["transactionHash"], lg["logIndex"])
+        if k not in seen and len(lg["topics"]) == 3:
+            seen.add(k)
+            out.append(lg)
+    return out
+
+
+def wallet_events(logs):
+    """Group Transfer logs by (tx, watched wallet) -> ins/outs per wallet."""
+    by_tx = {}
+    for lg in logs:
+        by_tx.setdefault(lg["transactionHash"], []).append(lg)
+    events = []
+    for tx, lgs in sorted(by_tx.items(), key=lambda kv: int(kv[1][0]["blockNumber"], 16)):
+        parts = set()
+        for lg in lgs:
+            parts.add("0x" + lg["topics"][1][-40:])
+            parts.add("0x" + lg["topics"][2][-40:])
+        for w in parts & WALLETS.keys():
+            ins, outs, cp_in, cp_out = {}, {}, set(), set()
+            for lg in lgs:
+                tok = lg["address"].lower()
+                s, r = "0x" + lg["topics"][1][-40:], "0x" + lg["topics"][2][-40:]
+                amt = int(lg["data"], 16) if lg["data"] not in ("0x", "") else 0
+                if s == w:
+                    outs[tok] = outs.get(tok, 0) + amt
+                    cp_out.add(r)
+                if r == w:
+                    ins[tok] = ins.get(tok, 0) + amt
+                    cp_in.add(s)
+            events.append({"tx": tx, "block": int(lgs[0]["blockNumber"], 16), "wallet": w,
+                           "ins": ins, "outs": outs, "cp_in": cp_in, "cp_out": cp_out})
+    return events
+
+
+def is_funding(tok):
+    """Cash never gets copied, and it is identified by ADDRESS only: on Arc several
+    memecoins are named "USDC", and the native-USDC system emitter logs look like a token."""
+    return tok.lower() in FUNDING_ADDRS or tok.lower() in {a.lower() for a in CFG.get("funding_tokens", [])}
+
+
+def is_stock_token(tok):
+    """Robinhood's tokenized equities/ETFs all carry the on-chain name suffix
+    '• Robinhood Token' (NVDA, SPY, GLD, DJT, ...)."""
+    return "robinhood token" in (token_meta(tok).get("name") or "").lower()
+
+
+# ---------------------------------------------------------------- trading
+
+def fmt_usd(x):
+    return f"${x:,.2f}"
+
+
+_gas = {"usdc": None, "ts": 0.0, "alerted": 0.0}
+
+
+def wallet_usdc(fresh=False):
+    """Wallet USDC (one balance: it pays gas AND is what we trade), cached 15s. Alerts once
+    per 10 min when it drops below what exits need."""
+    if fresh or time.time() - _gas["ts"] > 15:
+        try:
+            _gas["usdc"] = balance_of(USDC, SIGNER.address) / 10**USDC_DEC
+            _gas["ts"] = time.time()
+        except Exception:
+            pass
+    bal = _gas["usdc"] if _gas["usdc"] is not None else 0.0
+    if bal < CFG.get("critical_usdc", 1.0) and time.time() - _gas["alerted"] > 600:
+        _gas["alerted"] = time.time()
+        log(f"  [ALERT] wallet has only {fmt_usd(bal)} USDC — gas for exits is paid from it; top up")
+    return bal
+
+
+def _is_dead(pos):
+    note = pos.get("note") or ""
+    return ("drained" in note or "honeypot" in note or "unsellable" in note
+            or bool(pos.get("blocked_since")) or pos.get("sell_failures", 0) >= 3)
+
+
+def wallet_quarantine(wallet):
+    """Every rug so far was a YOUNG-pool buy (<60 min); the same wallets' buys of
+    established tokens have a 0% rug rate and make money. So a wallet with a bad
+    launch-sniping record only has its young-pool signals held back — its mature-token
+    signals keep flowing. Self-clearing as the 48h window rolls on."""
+    hours = CFG.get("quarantine_window_hours", 48)
+    young_max = CFG.get("young_pool_minutes", 60)
+    cutoff = time.time() - hours * 3600
+    recent = [p for p in list(STATE["positions"].values()) + STATE["closed"]
+              if p.get("origin") == wallet and p["bought_at"] >= cutoff
+              and (p.get("pool_age_min") is None or p["pool_age_min"] < young_max)]  # unknown age: assume young
+    rugs = sum(1 for p in recent if _is_dead(p))
+    if rugs >= CFG.get("quarantine_min_rugs", 3) and rugs / len(recent) >= CFG.get("quarantine_rug_rate", 0.5):
+        return f"{rugs} of its last {len(recent)} young-pool buys rugged"
+    return None
+
+
+def paper_cash():
+    if "paper_cash" not in STATE:
+        STATE["paper_cash"] = float(CFG.get("paper_cash_usd", 0))
+    return STATE["paper_cash"]
+
+
+def open_position(tok):
+    return STATE["positions"].get(tok.lower())
+
+
+def recently_closed(tok):
+    cutoff = time.time() - CFG.get("reentry_cooldown_hours", 24) * 3600
+    return any(c["token"] == tok.lower() and c["closed_at"] > cutoff for c in STATE["closed"])
+
+
+def rugged_before(tok):
+    """A token that already took $100 off us stays off the list for good. HUH rugged on
+    Sep 6, sat out the 24h cooldown, and was bought and rugged again on Sep 8 from the very
+    same pool."""
+    for c in STATE["closed"]:
+        if c["token"] != tok.lower():
+            continue
+        note = str(c.get("note", "")).lower()
+        if (c.get("pnl_usd") is not None and c["pnl_usd"] <= -0.85 * c.get("buy_usd", 100)) or \
+                any(k in note for k in ("drained", "rugged", "unsellable", "honeypot", "written off")):
+            return True
+    return False
+
+
+def handle_buy_signal(ev, tok, raw):
+    """A watched wallet received `raw` of `tok` in a swap. Copy it if new."""
+    meta = token_meta(tok)
+    t_detect = time.time()
+    sig = {"ts": round(t_detect, 3), "tx": ev["tx"], "block": ev["block"], "wallet": ev["wallet"],
+           "label": WALLETS[ev["wallet"]], "token": tok, "symbol": meta["symbol"],
+           "amount": raw / 10**meta["decimals"]}
+
+    def skip(why, quiet=False):
+        sig["outcome"] = f"skip: {why}"
+        append_jsonl("signals.jsonl", sig)
+        if not quiet:
+            log(f"  [skip] {sig['label']} bought {meta['symbol']}: {why}")
+
+    if open_position(tok):
+        return skip("already holding", quiet=True)
+    q_reason = wallet_quarantine(ev["wallet"])  # applied below, only to young-pool signals
+    excl = {x.lower() for x in CFG.get("exclude_tokens", [])}
+    if tok in excl or meta["symbol"].lower() in excl:
+        return skip("excluded by config", quiet=True)
+    if CFG.get("skip_stock_tokens", False) and is_stock_token(tok):
+        return skip("Robinhood stock token", quiet=True)
+    if rugged_before(tok):
+        return skip("rugged us before — never again", quiet=False)
+    if recently_closed(tok):
+        return skip("re-entry cooldown")
+    try:
+        prev = balance_of(tok, ev["wallet"], hex(ev["block"] - 1))
+    except Exception:
+        prev = 0  # can't read history: assume new (open-position dedupe still applies)
+    if prev > 0:
+        return skip(f"wallet already held {prev / 10**meta['decimals']:,.4g}")
+    # who paid? A real fomo fill is paid in USDC by fomo's payer through fomo's router and
+    # carries no ETH. Honeypot operators "buy" their own token INTO famous wallets with
+    # ETH (the ETH lands in their own pool, so it costs nothing) to bait copy traders.
+    try:
+        otx = rpc("eth_getTransactionByHash", [ev["tx"]])
+        # a Relay buy is paid by the solver sending native USDC (18dp) to Relay's router in the
+        # same tx; that is the trader's size (routes split over up to nine pools, so no single
+        # swap leg is)
+        paid = int(otx["value"], 16) / 1e18 if (otx.get("to") or "").lower() in BUY_SENDERS else None
+        sig.update(origin_to=(otx.get("to") or "")[:12], origin_paid_usd=round(paid, 2) if paid is not None else None,
+                   solver=(otx.get("from") or "")[:12])
+        if int(otx["value"], 16) > 0 and CFG.get("plant_gate", False):
+            return skip(f"value attached to the origin tx ({int(otx['value'], 16) / 1e18:.4f})")
+        if CFG.get("require_fomo_payer", False):
+            # strict: the buy must be fomo's own fill (router + USDC payer). Costs ~6% of real
+            # signals that arrive via other routers; off by default.
+            rec = rpc("eth_getTransactionReceipt", [ev["tx"]])
+            payers = {"0x" + l["topics"][1][-40:] for l in rec["logs"]
+                      if l["address"].lower() == USDC.lower() and len(l["topics"]) == 3 and l["topics"][0] == TRANSFER_TOPIC}
+            fomo = (otx.get("to") or "").lower().startswith(CFG.get("fomo_router_prefix", "0xccc88a9d")) and \
+                any(x.startswith(CFG.get("fomo_payer_prefix", "0xf70da978")) for x in payers)
+            sig["fomo_fill"] = fomo
+            if not fomo:
+                return skip("not a fomo-paid fill (strict mode)")
+    except Exception as e:
+        log(f"  [warn] origin tx check failed for {meta['symbol']}: {str(e)[:80]}")
+    t_origin = block_time(ev["block"])
+    age = t_detect - t_origin
+    sig["signal_age_s"] = round(age, 2)
+    if age > CFG.get("max_signal_age_s", 120):
+        return skip(f"signal {age:.0f}s old")
+    if len(STATE["positions"]) >= CFG.get("max_positions", 20):
+        return skip("max positions")
+    info = token_info(tok, fresh=True)
+    if not info["price"]:
+        return skip("no dexscreener price")
+    origin_usd = sig.get("origin_paid_usd") or sig["amount"] * info["price"]
+    sig["origin_usd"] = round(origin_usd, 2)
+    if origin_usd < CFG.get("min_origin_usd", 0):
+        return skip(f"origin buy only {fmt_usd(origin_usd)}")
+    if info["liquidity"] < CFG.get("min_liquidity_usd", 0):
+        return skip(f"liquidity {fmt_usd(info['liquidity'])} below min")
+    # pools 2-5 minutes old rugged 31% of the time (11 of 35 trades, net -$708); from 5 minutes
+    # on the rug rate falls to 14% and then ~0%, and that is where the profit lives (+$1.4K at 5-15)
+    age = pair_age_minutes(info)
+    if age is not None and age < CFG.get("min_pool_age_minutes", 5):
+        return skip(f"pool only {age:.1f} min old (rug window)")
+    if q_reason and (age is None or age < CFG.get("young_pool_minutes", 60)):
+        return skip(f"young pool + origin wallet's snipes quarantined: {q_reason}")
+    # fake-LP rugs (PLUMBER, 富贵, BTC): a minutes-old pool showing $0.9-1.6M of "liquidity"
+    # with 1-21 buys and ~0 sells. Real launches don't look like that.
+    if age is not None and age < CFG.get("fresh_pool_minutes", 30) and \
+            info["liquidity"] > CFG.get("fresh_pool_max_liquidity_usd", 500000):
+        return skip(f"pool {age:.0f} min old already showing {fmt_usd(info['liquidity'])} liquidity (fake LP pattern)")
+    # the same fake-LP bait with a pre-aged pool: ZDOG, ENCRYPTED and HUH (again) were pools
+    # created two days earlier and left idle, showing $0.9-1.6M of "liquidity" with 7-8 buys
+    # in 24h. Every real pool that size we have ever traded had thousands of trades a day
+    # (7 of 7 rugs vs 0 of 24 legit above $500K).
+    if info["liquidity"] > CFG.get("fresh_pool_max_liquidity_usd", 500000) and \
+            info["buys24"] < CFG.get("fake_lp_min_buys24", 100):
+        return skip(f"{fmt_usd(info['liquidity'])} of liquidity but only {info['buys24']} buys in 24h (fake LP pattern)")
+    if age is not None and age < CFG.get("young_pool_minutes", 60) and info["buys24"] >= 5 and \
+            info["sells24"] / info["buys24"] < CFG.get("young_pool_min_sell_ratio", 0.25):
+        return skip(f"young pool with {info['sells24']} sells vs {info['buys24']} buys")
+    sig.update(buys24=info["buys24"], sells24=info["sells24"], liquidity=round(info["liquidity"]),
+               pair_age_min=pair_age_minutes(info))
+    if CFG.get("honeypot_check", True):
+        hp = honeypot_reason(info)
+        if hp:
+            return skip(hp)
+        # a token many people buy but almost nobody sells is a honeypot in progress
+        # (PEZ family: 150-200 buys vs 4-18 sells while legit tokens run ~80-120%)
+        if info["buys24"] >= CFG.get("ratio_gate_min_buys", 30) and \
+                info["sells24"] / info["buys24"] < CFG.get("ratio_gate_min_sell_ratio", 0.15):
+            return skip(f"only {info['sells24']} sells vs {info['buys24']} buys (honeypot pattern)")
+    if info["liquidity"] < CFG.get("thin_liquidity_usd", 50000):
+        # small pool: insist that OTHER people have actually sold recently
+        need = CFG.get("thin_min_sells_24h", 5)
+        if info["sells24"] < need:
+            return skip(f"thin pool ({fmt_usd(info['liquidity'])}) with only {info['sells24']} sells in 24h")
+    # ask whether the token's previous buyers can still sell — runs alongside route discovery
+    # so it costs no latency (see holder_probe)
+    probe_box, probe_thread, relay_thread = {}, None, None
+    t_probe = time.time()
+    if CFG.get("holder_probe", True):
+        def _probe():
+            probe_box["code"] = bytecode_reason(tok)
+            probe_box["r"] = holder_probe(tok, ev["wallet"], ev["block"])
+        probe_thread = threading.Thread(target=_probe, daemon=True)
+        probe_thread.start()
+    if CFG.get("relay_gate", True):
+        relay_thread = threading.Thread(
+            target=lambda: probe_box.update(relay=relay_verdict(ev["tx"], ev["wallet"],
+                                                                t_probe + CFG.get("relay_wait_s", 2.5))), daemon=True)
+        relay_thread.start()
+    try:
+        legs_buy, legs_sell, desc, depth = discover_route(tok)
+    except Exception as e:
+        return skip(f"routing: {e}")
+
+    amount_in = int(CFG["buy_usd"] * 10**USDC_DEC)
+    try:
+        quote, impact, round_trip = quote_check(legs_buy, legs_sell, amount_in)
+    except Exception as e:
+        return skip(f"quote failed: {e}")
+    min_out = int(quote * (1 - SLIPPAGE))
+    sig.update(impact=round(impact, 4), round_trip=round(round_trip, 4))
+    if impact > CFG.get("max_price_impact_pct", 10) / 100:
+        return skip(f"price impact {impact:.1%} for {fmt_usd(CFG['buy_usd'])}")
+    if round_trip < -CFG.get("max_round_trip_loss_pct", 15) / 100:
+        return skip(f"round trip {round_trip:.1%} (thin pool or tax token)")
+    if probe_thread is not None:
+        probe_thread.join(CFG.get("holder_probe_wait_s", 1.0))
+        probe = probe_box.get("r")
+        if probe_box.get("code"):
+            sig["bytecode"] = "family"
+            return skip(probe_box["code"])
+        if probe_thread.is_alive():
+            sig["holders"] = "timeout"
+            log(f"  [warn] holder probe for {meta['symbol']} still running after routing; buying without it")
+        elif probe and probe.get("error"):
+            sig["holders"] = probe["error"]
+            log(f"  [warn] holder probe for {meta['symbol']} failed: {probe['error']}")
+        elif probe:
+            sig.update(holders_probed=probe["probed"], holders_ok=probe["ok"], holders_trapped=probe["trapped"],
+                       holders_pool_blocked=probe["pool_blocked"], holders_reason=probe["reasons"][:1])
+            why = holder_probe_reason(probe)
+            if why:
+                return skip(why)
+    funding = {"funding": "off", "payer": None, "referrer": None}
+    if relay_thread is not None:
+        relay_thread.join(max(0.0, t_probe + CFG.get("relay_wait_s", 2.5) - time.time()))
+        funding = probe_box.get("relay") or {"funding": "unknown", "payer": None, "referrer": None}
+        sig.update(funding=funding["funding"], payer=funding["payer"], referrer=funding.get("referrer"))
+        if funding["funding"] == "planted":
+            return skip(f"planted: not the trader's own fomo buy (referrer {funding.get('referrer')!r}, "
+                        f"origin chain {funding.get('chain')}, depositor {(funding['payer'] or '?')[:10]}..)")
+        if funding["funding"] == "unverifiable":
+            return skip("no paired Solana wallet on file for this trader: buy cannot be verified")
+        if funding["funding"] == "unknown" and CFG.get("relay_unknown", "skip") == "skip":
+            return skip(f"Relay gave no verified answer within {CFG.get('relay_wait_s', 5)}s (fail closed)")
+
+    t_route = time.time()  # route discovered + quoted
+    t0 = t_route
+    lat = None
+    if not CFG["live"]:
+        if paper_cash() < CFG["buy_usd"]:
+            return skip(f"insufficient paper cash ({fmt_usd(paper_cash())})")
+        STATE["paper_cash"] = paper_cash() - CFG["buy_usd"]
+    if CFG["live"]:
+        reserve = CFG.get("gas_reserve_usdc", 3.0)
+        bal = wallet_usdc(fresh=True)
+        if bal - CFG["buy_usd"] < reserve:
+            return skip(f"USDC {fmt_usd(bal)} would leave less than the {fmt_usd(reserve)} gas reserve")
+        try:
+            rec = swap_tx(legs_buy, amount_in, min_out)
+        except Exception as e:
+            # a fast-moving pool (StockCat: $2.9K origin buy into $39K of liquidity) can move
+            # past our 3% bound between the quote and the send. Re-quote once and retry,
+            # as long as the price is still within the impact cap of the signal-time quote.
+            if "slippage" not in str(e).lower() or not CFG.get("requote_on_slippage", True):
+                return skip(f"buy tx failed: {e}")
+            try:
+                quote2 = quote_route(legs_buy, amount_in)
+                moved = quote / quote2 - 1  # how much dearer the token got since the first quote
+                if moved > CFG.get("max_price_impact_pct", 10) / 100:
+                    return skip(f"buy tx failed: slippage, and a re-quote is {moved:+.1%} dearer than the signal-time quote")
+                min_out = int(quote2 * (1 - SLIPPAGE))
+                log(f"  [buy] {meta['symbol']}: slippage on the first send, re-quoted {moved:+.1%} and retrying")
+                rec = swap_tx(legs_buy, amount_in, min_out)
+                sig["requoted"] = round(moved, 4)
+            except Exception as e2:
+                return skip(f"buy tx failed after re-quote: {e2}")
+        got = received(rec, tok)
+        tx_hash = rec["transactionHash"]
+    else:
+        got, tx_hash = quote, None
+
+    # THE BUY IS DONE: record it before anything else can fail. (Once, a crash in
+    # the bookkeeping below made the same signal re-fire nine times.)
+    pos = {"token": tok, "symbol": meta["symbol"], "decimals": meta["decimals"], "sell_simulated": None,
+           "origin": ev["wallet"], "origin_label": WALLETS[ev["wallet"]], "signal_tx": ev["tx"],
+           "bought_at": time.time(), "buy_usd": CFG["buy_usd"], "buy_tx": tx_hash,
+           "initial_raw": got, "remaining_raw": got, "legs_sell": legs_sell, "route": desc,
+           "stages_done": [], "origin_exiting": False, "origin_done": False,
+           "usdc_out": 0.0, "sells": [], "retry_after": 0, "paper": not CFG["live"],
+           "signal_age_s": sig["signal_age_s"], "latency": None, "pool_age_min": age,
+           "funding": funding["funding"], "payer": funding["payer"]}
+    STATE["positions"][tok] = pos
+    save_state()
+
+    if CFG["live"]:
+        try:
+            fill_block = int(rec["blockNumber"], 16)
+            t_mined = block_time(fill_block)
+            sent = SIGNER.last_sent_ts or t_route
+            lat = {"origin_ts": t_origin, "detect_ts": round(t_detect, 3), "route_ts": round(t_route, 3),
+                   "sent_ts": round(sent, 3), "mined_ts": t_mined,
+                   "origin_block": ev["block"], "fill_block": fill_block,
+                   "detect": round(t_detect - t_origin, 2), "route": round(t_route - t_detect, 2),
+                   "send": round(sent - t_route, 2), "mine": round(max(0.0, t_mined - sent), 2),
+                   "total": round(t_mined - t_origin, 2), "blocks_behind": fill_block - ev["block"]}
+            sig["latency"] = pos["latency"] = lat
+        except Exception as e:
+            log(f"  [warn] latency bookkeeping failed for {meta['symbol']}: {str(e)[:100]}")
+        try:
+            ensure_allowance(tok, MAX_UINT)  # pre-approve so exits are a single tx
+        except Exception as e:
+            log(f"  [warn] pre-approve failed for {meta['symbol']}: {e}")
+        pos["sell_simulated"] = sell_simulates(tok, legs_sell, got)
+        if not pos["sell_simulated"]:
+            log(f"  [ALERT] {meta['symbol']}: a sell of what we just bought does NOT simulate — "
+                f"possible honeypot; exits will keep retrying")
+        save_state()
+    sig["outcome"] = "bought"
+    append_jsonl("signals.jsonl", sig)
+    append_jsonl("trades.jsonl", {"ts": time.time(), "side": "buy", "token": tok, "symbol": meta["symbol"],
+                                  "usd": CFG["buy_usd"], "raw": got, "tx": tx_hash, "paper": pos["paper"],
+                                  "origin": sig["label"], "route": desc})
+    if lat:
+        lat_s = (f"latency {lat['total']:.1f}s = detect {lat['detect']:.1f} + route {lat['route']:.1f} "
+                 f"+ send {lat['send']:.1f} + mine {lat['mine']:.1f} ({lat['blocks_behind']} blocks behind)")
+    else:
+        lat_s = f"signal age {age:.1f}s, route {t_route - t_detect:.1f}s"
+    log(f"  [BUY{'' if CFG['live'] else ' paper'}] {meta['symbol']} {fmt_usd(CFG['buy_usd'])} "
+        f"<- {sig['label']} bought {fmt_usd(origin_usd)} | {desc} | {lat_s}")
+
+
+def handle_sell_event(ev, tok):
+    pos = open_position(tok)
+    if pos and pos["origin"] == ev["wallet"] and not pos["origin_exiting"]:
+        pos["origin_exiting"] = True
+        save_state()
+        log(f"  [origin exit] {pos['origin_label']} is selling {pos['symbol']} -> releasing final tranche")
+
+
+_done_signals = {}  # (tx, wallet) -> ts; belt-and-braces against re-processing a window
+
+
+def process_events(events):
+    now = time.time()
+    for ev in events:
+        key = (ev["tx"], ev["wallet"])
+        if key in _done_signals:
+            continue
+        _done_signals[key] = now
+        try:
+            process_event(ev)
+        except Exception as e:
+            log(f"  [warn] signal {ev['tx'][:12]}.. from {WALLETS.get(ev['wallet'], '?')} failed: {str(e)[:160]}")
+    if len(_done_signals) > 5000:
+        for k in [k for k, t in _done_signals.items() if now - t > 3600]:
+            _done_signals.pop(k, None)
+
+
+BUY_SENDERS = {a.lower() for a in CFG.get("buy_senders", [RELAY_ROUTER])}
+
+
+def process_event(ev):
+    buys = [t for t in ev["ins"] if not is_funding(t)]
+    sells = [t for t in ev["outs"] if not is_funding(t)]
+    two_sided = bool(ev["ins"]) and bool(ev["outs"])
+    for t in buys:
+        # on Arc a fomo buy's last hop is Relay's router -> trader; everything else inbound
+        # (batch airdrops dominate launch day, fake stablecoins included) was not bought
+        if BUY_SENDERS:
+            if not ev["cp_in"] & BUY_SENDERS:
+                continue
+        elif not two_sided and not any(is_contract(c) for c in ev["cp_in"]):
+            continue
+        handle_buy_signal(ev, t, ev["ins"][t])
+    for t in sells:
+        if two_sided or any(is_contract(c) for c in ev["cp_out"]):
+            handle_sell_event(ev, t)
+
+
+def sell(pos, raw, why):
+    tok = pos["token"]
+    if CFG["live"] and why == "origin exit":
+        raw = balance_of(tok, SIGNER.address)  # sweep everything incl. dust
+    raw = min(raw, pos["remaining_raw"]) if not (CFG["live"] and why == "origin exit") else raw
+    if raw <= 0:
+        return True
+    legs, quote = best_sell_legs(pos, raw)
+    base = CFG.get("sell_slippage_pct", 6) / 100
+    bound = min(base * 1.5 ** pos.get("sell_failures", 0), CFG.get("sell_slippage_max_pct", 25) / 100)
+    if pos.get("sell_failures"):
+        log(f"  [sell] {pos['symbol']}: widening slippage bound to {bound:.0%} after {pos['sell_failures']} failure(s)")
+    min_out = int(quote * (1 - bound))
+    if CFG["live"]:
+        ensure_allowance(tok, raw)
+        try:
+            rec = swap_tx(legs, raw, min_out)
+        except TxPending as e:
+            pos["pending_tx"] = {"hash": e.tx_hash, "raw": raw, "why": why, "ts": time.time()}
+            save_state()
+            log(f"  [pending] {pos['symbol']} sell tx {e.tx_hash[:12]}.. broadcast, receipt not seen yet; "
+                f"will reconcile")
+            raise
+        got, tx_hash = received(rec, USDC), rec["transactionHash"]
+    else:
+        got, tx_hash = quote, None
+    usd = got / 10**USDC_DEC
+    if not CFG["live"]:
+        STATE["paper_cash"] = paper_cash() + usd
+    pos["sell_failures"] = 0
+    pos["retry_after"] = 0
+    record_sale(pos, raw, usd, why, tx_hash)
+    log(f"  [SELL{'' if CFG['live'] else ' paper'}] {pos['symbol']} {why}: "
+        f"{raw / 10**pos['decimals']:,.4g} -> {fmt_usd(usd)}")
+    return True
+
+
+def best_sell_legs(pos, raw):
+    """Quote the route stored at buy time and a fresh discovery; sells are not
+    latency-critical, so take whichever pays more (a deeper pool may have
+    appeared, or the buy went through a thin one)."""
+    best = None
+    try:
+        best = (pos["legs_sell"], quote_route(pos["legs_sell"], raw))
+    except Exception:
+        pass
+    try:
+        _lb, ls, desc, _d = discover_route(pos["token"])
+        q = quote_route(ls, raw)
+        if best is None or q > best[1]:
+            if best is not None:
+                log(f"  [route] {pos['symbol']} sell via fresh route ({desc}) pays "
+                    f"{q / best[1] - 1:+.1%} more than the stored one")
+            best = (ls, q)
+    except Exception:
+        pass
+    if best is None:
+        raise RuntimeError("no sell route quotes")
+    return best
+
+
+CMD_DIR = DATA / "commands"
+
+
+def process_commands():
+    """Execute requests dropped by the dashboard (data/commands/*.json):
+    {"action": "sell", "token": "0x..", "pct": 100}. The bot is the only
+    process that signs and the only writer of state.json, so the dashboard
+    never needs the key and nothing races."""
+    if not CMD_DIR.exists():
+        return
+    for f in sorted(CMD_DIR.glob("*.json")):
+        try:
+            cmd = json.loads(f.read_text())
+        except ValueError:
+            f.unlink()
+            continue
+        f.unlink()
+        result = {"ts": time.time(), "cmd": cmd}
+        try:
+            if cmd.get("action") == "book_sale":
+                book_sale(cmd["token"], cmd["tx"], cmd.get("why", "recovered"))
+                result["ok"] = True
+                append_jsonl("commands_done.jsonl", result)
+                continue
+            if cmd.get("action") == "adopt":
+                adopt_position(cmd["token"], float(cmd["usd"]), cmd.get("bought_at"))
+                result["ok"] = True
+                append_jsonl("commands_done.jsonl", result)
+                continue
+            if cmd.get("action") != "sell":
+                raise ValueError(f"unknown action {cmd.get('action')!r}")
+            pos = open_position(cmd["token"])
+            if not pos:
+                raise ValueError("no open position")
+            pct = int(cmd.get("pct", 100))
+            if pos["remaining_raw"] <= pos["initial_raw"] * 0.001:
+                raise ValueError("nothing left to sell (already fully exited; closing)")
+            raw = pos["remaining_raw"] if pct >= 100 else int(pos["initial_raw"] * pct / 100)
+            log(f"  [dashboard] sell {pct}% of {pos['symbol']} requested")
+            sell(pos, raw, "origin exit" if pct >= 100 else f"manual {pct}%")
+            if pct >= 100:
+                pos["origin_done"] = True
+                for i in range(len(CFG["exits"])):
+                    if i not in pos["stages_done"]:
+                        pos["stages_done"].append(i)
+            save_state()
+            result["ok"] = True
+        except Exception as e:
+            result.update(ok=False, error=str(e)[:300])
+            log(f"  [dashboard] sell failed: {e}")
+        append_jsonl("commands_done.jsonl", result)
+
+
+def stage_seconds(st):
+    return st["after_minutes"] * 60 if "after_minutes" in st else st["after_hours"] * 3600
+
+
+def stage_label(st):
+    return f"+{st['after_minutes']:g}m" if "after_minutes" in st else f"+{st['after_hours']:g}h"
+
+
+def record_sale(pos, raw, usd, why, tx_hash):
+    pos["remaining_raw"] = max(0, pos["remaining_raw"] - raw)
+    pos["usdc_out"] += usd
+    pos["sells"].append({"ts": time.time(), "why": why, "raw": raw, "usd": usd, "tx": tx_hash})
+    append_jsonl("trades.jsonl", {"ts": time.time(), "side": "sell", "token": pos["token"], "symbol": pos["symbol"],
+                                  "usd": usd, "raw": raw, "tx": tx_hash, "paper": pos["paper"], "why": why})
+
+
+def mark_stage_for(pos, why):
+    """Keep stage bookkeeping consistent when a sale is recorded after the fact."""
+    for i, st in enumerate(CFG["exits"]):
+        if why.startswith(stage_label(st) + " ") and i not in pos["stages_done"]:
+            pos["stages_done"].append(i)
+    if why == "origin exit":
+        pos["origin_done"] = True
+
+
+def reconcile_position(pos):
+    """Live only. (1) Settle a sell whose receipt we missed. (2) If the wallet
+    holds less than the position says and no sale explains it, find the
+    proceeds on-chain (USDC into our wallet in a tx that moved this token out)
+    and record them; otherwise just sync the amount so exits use real numbers."""
+    tok = pos["token"]
+    pend = pos.get("pending_tx")
+    if pend:
+        rec = None
+        try:
+            rec = rpc("eth_getTransactionReceipt", [pend["hash"]], retries=1)
+        except Exception:
+            pass
+        if rec:
+            pos["pending_tx"] = None
+            if int(rec["status"], 16) == 1:
+                usd = received(rec, USDC) / 10**USDC_DEC
+                record_sale(pos, pend["raw"], usd, pend["why"], rec["transactionHash"])
+                mark_stage_for(pos, pend["why"])
+                log(f"  [reconciled] {pos['symbol']} {pend['why']} confirmed: {fmt_usd(usd)}")
+            else:
+                log(f"  [reconciled] {pos['symbol']} pending sell reverted; will retry")
+            save_state()
+        elif time.time() - pend["ts"] > 600:
+            pos["pending_tx"] = None  # dropped from the mempool
+            save_state()
+        return
+    bal = balance_of(tok, SIGNER.address)
+    if bal >= pos["remaining_raw"] * 0.99:
+        return  # fine
+    # unexplained shortfall (possibly the whole bag): look for our own sale on-chain
+    missing = pos["remaining_raw"] - bal
+    found = find_unrecorded_sale(pos, {s["tx"] for s in pos["sells"] if s.get("tx")})
+    if found:
+        usd, tx_hash, why = found
+        record_sale(pos, missing, usd, why, tx_hash)
+        mark_stage_for(pos, why)
+        log(f"  [reconciled] {pos['symbol']}: found unrecorded sale {tx_hash[:12]}.. for {fmt_usd(usd)}; "
+            f"position synced to wallet ({bal / 10**pos['decimals']:,.4g})")
+    else:
+        if bal == 0:
+            return  # nothing found: the external-sale check will close it as sold outside the bot
+        pos["remaining_raw"] = bal
+        log(f"  [reconciled] {pos['symbol']}: wallet holds {bal / 10**pos['decimals']:,.4g}, less than recorded; "
+            f"synced (proceeds unknown, pnl will understate)")
+    save_state()
+
+
+def find_unrecorded_sale(pos, known_txs):
+    """USDC Transfer logs into our wallet since the buy -> the most recent tx that also
+    moved pos.token OUT of our wallet. Windowed: Arc's nodes cap log ranges."""
+    me = pad(SIGNER.address)
+    flt = {"address": USDC, "topics": [TRANSFER_TOPIC, None, me]}
+    try:
+        head = int(rpc("eth_blockNumber", []), 16)
+        start = max(1, block_at_ts(pos["bought_at"]) - 50)
+        logs = logs_windowed(flt, start, head, newest_first=True, stop_when=lambda got: len(got) >= 15)
+    except Exception:
+        logs = None
+    if not logs:
+        return None
+    for lg in sorted(logs, key=lambda l: -int(l["blockNumber"], 16))[:15]:
+        tx = lg["transactionHash"]
+        if tx in known_txs:
+            continue
+        try:
+            rec = rpc("eth_getTransactionReceipt", [tx])
+        except Exception:
+            continue
+        if not rec:
+            continue
+        moved_token_out = any(l["address"].lower() == pos["token"] and len(l["topics"]) == 3
+                              and l["topics"][1] == me for l in rec["logs"])
+        if moved_token_out and int(rec["blockNumber"], 16) > 0:
+            usd = received(rec, USDC) / 10**USDC_DEC
+            elapsed = time.time() - pos["bought_at"]
+            why = "recovered"
+            for i, st in enumerate(CFG["exits"]):
+                if i not in pos["stages_done"] and elapsed >= stage_seconds(st):
+                    why = f"{stage_label(st)} {st['pct']}% (recovered)"
+                    break
+            return usd, tx, why
+    return None
+
+
+def write_off_if_dead(pos, now):
+    """A pool whose liquidity was pulled quotes nothing forever. Once the token
+    has shown zero liquidity for 30+ minutes and the bag is unsellable, close it
+    as a loss so the exit loop stops retrying it every hour."""
+    try:
+        info = token_info(pos["token"], fresh=True)
+    except Exception:
+        return False
+    if (info.get("liquidity") or 0) >= CFG.get("dead_pool_liquidity_usd", 100):
+        return False
+    pos["dead_since"] = pos.get("dead_since") or now
+    if now - pos["dead_since"] < 1800:
+        return False
+    pos.update(closed_at=now, pnl_usd=pos["usdc_out"] - pos["buy_usd"], note="pool drained (rugged); written off")
+    STATE["closed"].append(pos)
+    STATE["positions"].pop(pos["token"], None)
+    save_state()
+    log(f"  [closed] {pos['symbol']}: pool drained, no liquidity left — written off at {fmt_usd(pos['pnl_usd'])}")
+    return True
+
+
+def close_if_done(pos, now):
+    """Move a position to closed once nothing is left to sell (all tranches
+    done, rounding dust, or sold out via origin exit / dashboard)."""
+    all_timed = len(pos["stages_done"]) == len(CFG["exits"])
+    dust = pos["remaining_raw"] <= pos["initial_raw"] * 0.001
+    if not (pos["remaining_raw"] <= 0 or dust or (all_timed and pos["origin_done"])):
+        return False
+    if pos.get("pending_tx"):
+        return False
+    pos["closed_at"] = now
+    pos["pnl_usd"] = pos["usdc_out"] - pos["buy_usd"]
+    STATE["closed"].append(pos)
+    STATE["positions"].pop(pos["token"], None)
+    save_state()
+    log(f"  [closed] {pos['symbol']} pnl {fmt_usd(pos['pnl_usd'])}")
+    return True
+
+
+def book_sale(token, tx_hash, why="recovered"):
+    """Record a sale that happened on-chain but was never booked (open or
+    closed position), from its receipt: USDC received and tokens moved out."""
+    tok = token.lower()
+    rec = rpc("eth_getTransactionReceipt", [tx_hash])
+    if not rec or int(rec["status"], 16) != 1:
+        raise ValueError("tx not found or reverted")
+    me = SIGNER.address.lower()
+    usd = received(rec, USDC) / 10**USDC_DEC
+    raw = sum(int(l["data"], 16) for l in rec["logs"] if l["address"].lower() == tok and len(l["topics"]) == 3
+              and l["topics"][0] == TRANSFER_TOPIC and "0x" + l["topics"][1][-40:] == me)
+    pos = open_position(tok) or next((c for c in reversed(STATE["closed"]) if c["token"] == tok), None)
+    if pos is None:
+        raise ValueError("no position for that token")
+    if any(x.get("tx") == tx_hash for x in pos["sells"]):
+        raise ValueError("already booked")
+    record_sale(pos, min(raw, pos["remaining_raw"]) if pos["remaining_raw"] else 0, usd, why, tx_hash)
+    if "closed_at" in pos:
+        pos["pnl_usd"] = pos["usdc_out"] - pos["buy_usd"]
+        pos["note"] = (pos.get("note") or "") + f"; booked {tx_hash[:10]} later"
+    save_state()
+    log(f"  [booked] {pos['symbol']} sale {tx_hash[:12]}.. {fmt_usd(usd)} ({why}); pnl now {fmt_usd(pos['usdc_out'] - pos['buy_usd'])}")
+
+
+def adopt_position(token, usd, bought_at=None):
+    """Register tokens the wallet holds but the bot never recorded (e.g. after a
+    crash between fill and bookkeeping) so the normal exits handle them."""
+    tok = token.lower()
+    if open_position(tok):
+        raise ValueError("already an open position")
+    meta = token_meta(tok)
+    bal = balance_of(tok, SIGNER.address)
+    if bal == 0:
+        raise ValueError("wallet holds none of it")
+    _lb, legs_sell, desc, _d = discover_route(tok)
+    pos = {"token": tok, "symbol": meta["symbol"], "decimals": meta["decimals"], "sell_simulated": None,
+           "origin": "", "origin_label": "adopted", "signal_tx": None,
+           "bought_at": float(bought_at or time.time()), "buy_usd": usd, "buy_tx": None,
+           "initial_raw": bal, "remaining_raw": bal, "legs_sell": legs_sell, "route": desc,
+           "stages_done": [], "origin_exiting": False, "origin_done": False,
+           "usdc_out": 0.0, "sells": [], "retry_after": 0, "paper": False, "signal_age_s": None,
+           "latency": None, "note": "adopted from wallet"}
+    STATE["positions"][tok] = pos
+    save_state()
+    log(f"  [adopted] {meta['symbol']}: {bal / 10**meta['decimals']:,.4g} tokens, cost basis {fmt_usd(usd)}, "
+        f"exits run on the normal schedule")
+
+
+def run_exits():
+    now = time.time()
+    for tok, pos in list(STATE["positions"].items()):
+        if close_if_done(pos, now):
+            continue
+        # reconcile BEFORE any retry back-off: a "failed" sell may in fact have
+        # gone through (lost response), and that must be booked promptly
+        if CFG["live"] and now - pos.get("_reconciled_at", 0) > 10:
+            pos["_reconciled_at"] = now
+            try:
+                reconcile_position(pos)
+            except Exception as e:
+                log(f"  [warn] reconcile {pos['symbol']}: {str(e)[:120]}")
+            if close_if_done(pos, now):
+                continue
+        if now < pos.get("retry_after", 0):
+            continue
+        elapsed = now - pos["bought_at"]
+        try:
+            if CFG["live"]:
+                if pos.get("pending_tx"):
+                    continue  # don't send another sell while one is unresolved
+            if CFG["live"] and pos["remaining_raw"] > 0 and balance_of(tok, SIGNER.address) <= pos["initial_raw"] * 0.001:
+                log(f"  [closed] {pos['symbol']}: wallet no longer holds it (sold outside the bot)")
+                pos.update(closed_at=now, remaining_raw=0, pnl_usd=pos["usdc_out"] - pos["buy_usd"],
+                           note="sold externally")
+                STATE["closed"].append(pos)
+                del STATE["positions"][tok]
+                save_state()
+                continue
+            if pos.get("funding") == "unknown" and elapsed >= CFG.get("relay_watch_s", 180):
+                pos["funding"] = "norelay"  # never indexed: not a Relay fill (other routers)
+            if pos.get("funding") == "unknown" and CFG.get("relay_gate", True) and \
+                    elapsed < CFG.get("relay_watch_s", 300) and now - pos.get("_relay_at", 0) > 3:
+                pos["_relay_at"] = now
+                v = relay_verdict(pos["signal_tx"], pos["origin"], now)  # one lookup, no waiting
+                if v["funding"] != "unknown":
+                    pos.update(funding=v["funding"], payer=v["payer"], referrer=v.get("referrer"))
+                    save_state()
+                    if v["funding"] == "planted" and pos["remaining_raw"] > 0:
+                        log(f"  [ALERT] {pos['symbol']}: Relay says the origin buy was PLANTED (referrer {v.get('referrer')!r}, "
+                            f"payer {(v['payer'] or '?')[:10]}..) — selling everything now, before the pool is pulled")
+                        sell(pos, pos["remaining_raw"], "planted (Relay request not from the fomo app)")
+                        pos["stages_done"] = list(range(len(CFG["exits"])))
+                        pos["origin_done"] = True
+                        save_state()
+                        continue
+            for i, st in enumerate(CFG["exits"]):
+                if i in pos["stages_done"] or elapsed < stage_seconds(st):
+                    continue
+                sell(pos, int(pos["initial_raw"] * st["pct"] / 100), f"{stage_label(st)} {st['pct']}%")
+                pos["stages_done"].append(i)
+                save_state()
+            if pos["origin_exiting"] and not pos["origin_done"]:
+                sell(pos, pos["remaining_raw"], "origin exit")
+                pos["origin_done"] = True
+                save_state()
+            # every timed stage is done and the schedule adds up to a full exit, yet
+            # something is left (e.g. the schedule changed while the position was open):
+            # finish the job instead of waiting on the origin wallet
+            if (len(pos["stages_done"]) == len(CFG["exits"]) and sum(st["pct"] for st in CFG["exits"]) >= 100
+                    and pos["remaining_raw"] > pos["initial_raw"] * 0.001 and not pos["origin_done"]):
+                sell(pos, pos["remaining_raw"], "remainder")
+                pos["origin_done"] = True
+                save_state()
+        except TxPending:
+            continue
+        except Exception as e:
+            pos["sell_failures"] = pos.get("sell_failures", 0) + 1
+            msg = str(e)
+            low = msg.lower()
+            # sells that have failed for hours regardless of reason: the bag is not coming back
+            if pos["sell_failures"] >= CFG.get("unsellable_failures", 12) and \
+                    now - pos["bought_at"] > CFG.get("unsellable_hours", 3) * 3600:
+                pos.update(closed_at=now, pnl_usd=pos["usdc_out"] - pos["buy_usd"],
+                           note=f"unsellable after {pos['sell_failures']} attempts over {(now - pos['bought_at']) / 3600:.0f}h; written off")
+                STATE["closed"].append(pos)
+                STATE["positions"].pop(tok, None)
+                save_state()
+                log(f"  [closed] {pos['symbol']}: unsellable after {pos['sell_failures']} attempts — written off at {fmt_usd(pos['pnl_usd'])}")
+                continue
+            # a remainder worth less than the gas it takes to keep trying: write it off
+            if pos["sell_failures"] >= 5:
+                try:
+                    mark = pos["remaining_raw"] / 10**pos["decimals"] * (token_info(tok)["price"] or 0)
+                except Exception:
+                    mark = None
+                if mark is not None and mark < CFG.get("dust_write_off_usd", 10):
+                    pos.update(closed_at=now, pnl_usd=pos["usdc_out"] - pos["buy_usd"],
+                               note=f"unsellable remainder worth ~${mark:.2f}; written off")
+                    STATE["closed"].append(pos)
+                    STATE["positions"].pop(tok, None)
+                    save_state()
+                    log(f"  [closed] {pos['symbol']}: unsellable remainder worth ~{fmt_usd(mark)} after "
+                        f"{pos['sell_failures']} failures — written off at {fmt_usd(pos['pnl_usd'])}")
+                    continue
+            if any(k in low for k in ("blocked", "cannot sell", "blacklist", "not allowed", "trading not", "paused")):
+                # the TOKEN refuses the transfer: a honeypot switch. Alert once, retry rarely.
+                pos["blocked_since"] = pos.get("blocked_since") or now
+                if now - pos["blocked_since"] > CFG.get("blocked_write_off_hours", 6) * 3600:
+                    pos.update(closed_at=now, pnl_usd=pos["usdc_out"] - pos["buy_usd"],
+                               note="honeypot: token blocks selling; written off")
+                    STATE["closed"].append(pos)
+                    STATE["positions"].pop(tok, None)
+                    save_state()
+                    log(f"  [closed] {pos['symbol']}: sells blocked for 6h — written off at {fmt_usd(pos['pnl_usd'])}")
+                    continue
+                if not pos.get("blocked_alerted"):
+                    pos["blocked_alerted"] = True
+                    log(f"  [ALERT] {pos['symbol']}: the token contract blocks selling ({msg.split('reverted:')[-1].strip()[:40]!r}). "
+                        f"This is a honeypot; retrying every 15 min and writing off once the pool is drained.")
+                if write_off_if_dead(pos, now):
+                    continue
+                wait = 900
+            elif "slippage" in low or "reverted" in low:
+                # price moving fast: re-quote quickly with a wider bound (see sell()); never park a live position
+                wait = 5 if pos["sell_failures"] <= 3 else 60
+            elif "no sell route" in low or "quote reverted" in low:
+                if write_off_if_dead(pos, now):
+                    continue
+                wait = min(CFG.get("sell_retry_seconds", 300) * 2 ** (pos["sell_failures"] - 1), 3600)
+            else:
+                wait = min(CFG.get("sell_retry_seconds", 300) * 2 ** (pos["sell_failures"] - 1), 3600)
+            pos["retry_after"] = now + wait
+            save_state()
+            if wait < 900:
+                log(f"  [warn] sell {pos['symbol']} failed ({pos['sell_failures']}x), retry in {wait // 60}m: {str(e)[:160]}")
+            continue
+        close_if_done(pos, now)
+
+
+# ---------------------------------------------------------------- poll tick
+
+_wl_pad = None
+
+
+def poll_once(cursor, url=None):
+    """Scan blocks cursor+1..head in fixed windows (Alchemy's free tier allows 10
+    blocks per eth_getLogs; Arc makes ~2 blocks/s). Each window is one
+    batched HTTP request; STATE["last_block"] advances after each window, so a
+    failure mid-scan resumes exactly where it stopped and nothing is skipped.
+    `url` forces a specific RPC (the websocket backstop sweeps the public one)."""
+    global _wl_pad
+    if _wl_pad is None:
+        _wl_pad = [pad(a) for a in WALLETS]
+    last = cursor
+    # scan to one block behind the reported head: a load-balanced RPC can answer
+    # the log query from a node that has not seen the newest block yet
+    head = int(rpc("eth_blockNumber", [], url=url), 16) - 1
+    # Alchemy's free/PAYG tiers cap eth_getLogs at 10 blocks; the public RPC and most
+    # other providers don't, so scan wider windows there (fewer requests, less lag)
+    chunk = CFG.get("log_chunk_blocks", 10) if "alchemy" in (url or rpc_url()) else CFG.get("log_chunk_blocks_open", 50)
+    max_lag = CFG.get("max_catchup_blocks", 600)
+    if head - last > max_lag:
+        # after a stall the old blocks are past max_signal_age anyway: jump
+        log(f"  [watch] {head - last} blocks behind, skipping ahead to the last {max_lag}")
+        last = head - max_lag
+    while last < head:
+        to = min(last + chunk, head)
+        rng = {"fromBlock": hex(last + 1), "toBlock": hex(to)}
+        l1, l2 = rpc_batch([
+            ("eth_getLogs", [{**rng, "topics": [TRANSFER_TOPIC, _wl_pad]}]),
+            ("eth_getLogs", [{**rng, "topics": [TRANSFER_TOPIC, None, _wl_pad]}])], url=url)
+        uniq = {(lg["transactionHash"], lg["logIndex"]): lg for lg in l1 + l2 if len(lg["topics"]) == 3}
+        if uniq:
+            process_events(wallet_events(list(uniq.values())))
+        last = to
+        STATE["last_block"] = last
+    return last
+
+
+# ---------------------------------------------------------------- websocket detection
+
+class WsFeed(threading.Thread):
+    """Subscribes to Transfer logs touching the watched wallets over a websocket
+    (Alchemy: wss://<network>.g.alchemy.com/v2/<key>). Logs land in `queue`
+    with their arrival time; the main loop groups them per tx after a short
+    grace period. Reconnects forever; `healthy()` says whether the main loop
+    may rely on it."""
+
+    def __init__(self, url):
+        super().__init__(daemon=True)
+        self.url = url
+        self.queue = []
+        self.lock = threading.Lock()
+        self.connected = False
+        self.last_msg = 0.0
+        self.last_block = 0
+        self.subs = 0
+        self.stop = threading.Event()
+
+    def healthy(self):
+        return self.connected and self.subs >= 2 and time.time() - self.last_msg < CFG.get("ws_stale_seconds", 90)
+
+    def run(self):
+        import websocket  # websocket-client
+        wl = [pad(a) for a in WALLETS]
+        backoff = 1
+        while not self.stop.is_set():
+            try:
+                ws = websocket.create_connection(self.url, timeout=20, suppress_origin=True)
+                self.connected = True
+                self.subs = 0
+                for i, topics in enumerate(([TRANSFER_TOPIC, wl], [TRANSFER_TOPIC, None, wl])):
+                    ws.send(json.dumps({"jsonrpc": "2.0", "id": i + 1, "method": "eth_subscribe",
+                                        "params": ["logs", {"topics": topics}]}))
+                ws.settimeout(30)
+                last_ping = time.time()
+                self.last_msg = time.time()
+                while not self.stop.is_set():
+                    try:
+                        msg = ws.recv()
+                    except websocket.WebSocketTimeoutException:
+                        if time.time() - last_ping > 25:
+                            ws.ping()
+                            last_ping = time.time()
+                        continue
+                    if not msg:
+                        continue
+                    self.last_msg = time.time()
+                    m = json.loads(msg)
+                    if "id" in m and m.get("result") and not m.get("method"):
+                        self.subs += 1
+                        if self.subs == 2:
+                            log(f"  [ws] subscribed to Transfer logs for {len(WALLETS)} wallets")
+                            backoff = 1
+                        continue
+                    if m.get("error"):
+                        raise RuntimeError(f"subscription error: {m['error']}")
+                    if m.get("method") == "eth_subscription":
+                        lg = m["params"]["result"]
+                        if lg.get("removed"):
+                            continue
+                        with self.lock:
+                            self.queue.append((time.time(), lg))
+                        self.last_block = max(self.last_block, int(lg["blockNumber"], 16))
+            except Exception as e:
+                self.connected = False
+                self.subs = 0
+                log(f"  [ws] disconnected ({str(e)[:100]}); reconnecting in {backoff}s (polling covers the gap)")
+                append_jsonl("rpc_events.jsonl", {"ts": time.time(), "event": "ws_disconnect", "error": str(e)[:200]})
+                time.sleep(backoff)
+                backoff = min(backoff * 2, 30)
+            finally:
+                try:
+                    ws.close()
+                except Exception:
+                    pass
+
+    def drain(self, grace=0.2):
+        """Logs that arrived at least `grace` seconds ago (so a tx's several
+        Transfer logs are grouped), oldest first."""
+        cutoff = time.time() - grace
+        with self.lock:
+            ready = [lg for ts, lg in self.queue if ts <= cutoff]
+            self.queue = [(ts, lg) for ts, lg in self.queue if ts > cutoff]
+        return ready
+
+
+_ws_lag = {"ts": 0.0}
+
+
+def ws_url_for(rpc_http):
+    explicit = ENV.get("WS_URL") or CFG.get("ws_url")
+    if explicit:
+        return explicit
+    if "alchemy.com" in rpc_http:
+        return rpc_http.replace("https://", "wss://", 1)
+    return None
+
+
+# ---------------------------------------------------------------- commands
+
+def cmd_run():
+    global SIGNER
+    live = CFG["live"]
+    if live:
+        if not ROUTER:
+            sys.exit("config.router is empty: deploy contracts/src/CopyRouter.sol first (see README)")
+        key = ENV.get("PRIVATE_KEY")
+        if not key:
+            sys.exit("PRIVATE_KEY missing from .env")
+        SIGNER = Signer(key)
+        while True:
+            try:
+                usdc = balance_of(USDC, SIGNER.address) / 10**USDC_DEC
+                break
+            except Exception as e:
+                log(f"  [warn] startup RPC check failed, retrying in 5s: {str(e)[:120]}")
+                time.sleep(5)
+        log(f"LIVE wallet {SIGNER.address}: {usdc:,.2f} USDC (pays gas too; "
+            f"{fmt_usd(CFG.get('gas_reserve_usdc', 3.0))} is held back for exits)")
+        if usdc < CFG["buy_usd"] + CFG.get("gas_reserve_usdc", 3.0):
+            log(f"  [ALERT] USDC below one buy plus the gas reserve: no NEW buys until topped up; "
+                f"exits will still be attempted")
+        # positions simulated in paper mode were never bought: archive them so
+        # the live loop doesn't try to sell tokens the wallet doesn't hold
+        paper = [t for t, pos in STATE["positions"].items() if pos.get("paper")]
+        for t in paper:
+            pos = STATE["positions"].pop(t)
+            pos.update(closed_at=time.time(), pnl_usd=0.0, note="paper position archived at live start")
+            STATE["closed"].append(pos)
+        if paper:
+            save_state()
+            log(f"archived {len(paper)} paper position(s) from the dry run")
+        while True:
+            try:
+                ensure_allowance(USDC, MAX_UINT)
+                break
+            except Exception as e:
+                log(f"  [warn] allowance check failed, retrying in 5s: {str(e)[:120]}")
+                time.sleep(5)
+    else:
+        log(f"PAPER mode (config.live = false): simulated fills at on-chain quotes, nothing is sent"
+            + (f"; bankroll {fmt_usd(paper_cash())}" if CFG.get("paper_cash_usd") else ""))
+
+    while True:
+        try:
+            last = int(rpc("eth_blockNumber", []), 16)
+            break
+        except Exception as e:
+            log(f"  [warn] can't read the chain head yet, retrying in 5s: {str(e)[:120]}")
+            time.sleep(5)
+    STATE["last_block"] = last
+    log(f"watching {len(WALLETS)} wallets on Arc from block {last}, "
+        f"buy {fmt_usd(CFG['buy_usd'])}/signal, exits {CFG['exits']} + remainder on origin exit")
+    poll = CFG.get("poll_seconds", 1)
+    throttled, last_throttle_log = 0, 0.0
+    feed = None
+    if CFG.get("ws", False):
+        wsu = ws_url_for(RPC_URL)
+        if wsu:
+            feed = WsFeed(wsu)
+            feed.start()
+            log(f"websocket detection ON ({wsu.split('/v2/')[0]}...), backstop sweep every "
+                f"{CFG.get('ws_backstop_seconds', 20)}s on {FALLBACK_RPC.split('//')[1]}")
+        else:
+            log("websocket detection requested but no wss URL (set WS_URL or use an Alchemy RPC_URL); polling")
+    last_sweep = time.time()
+    last_exits = 0.0
+    last_beat = time.time()
+    while True:
+        # heartbeat: proves the loop is alive and shows how far behind the chain we are
+        if time.time() - last_beat >= CFG.get("heartbeat_seconds", 120):
+            last_beat = time.time()
+            try:
+                head = int(rpc("eth_blockNumber", []), 16)
+                mode = ("ws" if (feed is not None and feed.healthy()) else
+                        "public-rpc" if rpc_url() == FALLBACK_RPC else
+                        "alchemy" if "alchemy" in rpc_url() else "primary-rpc")
+                log(f"  [beat] {head - STATE['last_block']} blocks behind head via {mode}; "
+                    f"{len(STATE['positions'])} open; {'USDC %.2f' % wallet_usdc() if CFG['live'] else 'paper'}")
+            except Exception as e:
+                log(f"  [beat] head check failed: {str(e)[:80]}")
+        try:
+            if feed is not None and feed.healthy():
+                # fast path: events straight off the socket, grouped per tx
+                time.sleep(0.1)
+                logs = feed.drain()
+                if logs:
+                    newest = max(int(lg["blockNumber"], 16) for lg in logs)
+                    try:  # how far behind the block's own timestamp did the socket deliver? (sampled)
+                        if time.time() - _ws_lag["ts"] > 30:
+                            _ws_lag["ts"] = time.time()
+                            append_jsonl("ws_lag.jsonl", {"ts": time.time(), "block": newest,
+                                                          "lag_s": round(time.time() - 0.2 - block_time(newest), 2)})
+                    except Exception:
+                        pass
+                    uniq = {(lg["transactionHash"], lg["logIndex"]): lg for lg in logs if len(lg["topics"]) == 3}
+                    process_events(wallet_events(list(uniq.values())))
+                    STATE["last_block"] = max(STATE["last_block"], newest - 1)
+                # backstop: sweep everything since the cursor on the free public RPC
+                if time.time() - last_sweep >= CFG.get("ws_backstop_seconds", 20):
+                    last_sweep = time.time()
+                    poll_once(STATE["last_block"], url=FALLBACK_RPC)
+                if time.time() - last_exits >= 1.0:
+                    last_exits = time.time()
+                    process_commands()
+                    run_exits()
+                continue
+            time.sleep(poll if rpc_url() == RPC_URL else max(poll, CFG.get("fallback_poll_seconds", 3.0)))
+            last = poll_once(STATE["last_block"])
+            process_commands()
+            run_exits()
+        except KeyboardInterrupt:
+            save_state()
+            raise
+        except requests.HTTPError as e:
+            if getattr(e.response, "status_code", 0) in (401, 403) and RPC_URL != FALLBACK_RPC:
+                continue  # primary rejected the key; failover accounting already logged it
+            if getattr(e.response, "status_code", 0) == 429:
+                # public RPC throttling: nothing is lost (cursor did not advance);
+                # ease off for a tick and only mention it once a minute
+                throttled += 1
+                if time.time() - last_throttle_log > 60:
+                    log(f"  [rpc] throttled x{throttled} in the last minute (HTTP 429) — nothing skipped; "
+                        f"raise poll_seconds if this keeps happening")
+                    last_throttle_log, throttled = time.time(), 0
+                time.sleep(1)
+            else:
+                log(f"  [warn] poll failed, retrying: {e}")
+        except Exception as e:
+            if "beyond current head" not in str(e):  # node lag: silently retry next tick
+                log(f"  [warn] poll failed, retrying: {e}")
+
+
+def cmd_status():
+    total = 0.0
+    print(f"Open positions ({len(STATE['positions'])}):")
+    for pos in STATE["positions"].values():
+        px = token_info(pos["token"])["price"] or 0
+        held = pos["remaining_raw"] / 10**pos["decimals"]
+        value = held * px
+        pnl = value + pos["usdc_out"] - pos["buy_usd"]
+        total += pnl
+        age_h = (time.time() - pos["bought_at"]) / 3600
+        flags = ""
+        if pos.get("sell_simulated") is False:
+            flags += " SELL-SIM-FAILED"
+        if pos.get("retry_after", 0) > time.time():
+            flags += f" sell-retry-in-{int(pos['retry_after'] - time.time())}s"
+        print(f"  {pos['symbol']:<10} {fmt_usd(pos['buy_usd']):>8} in | held {fmt_usd(value):>9} "
+              f"+ sold {fmt_usd(pos['usdc_out']):>8} | pnl {pnl:+8.2f} | {age_h:5.1f}h | "
+              f"stages {pos['stages_done']} origin_exit={pos['origin_exiting']} | from {pos['origin_label']}"
+              f"{' (paper)' if pos['paper'] else ''}{flags}")
+        print(f"             {pos['token']}   https://explorer.arc.io/token/{pos['token']}")
+    print(f"Closed ({len(STATE['closed'])}):")
+    for pos in STATE["closed"][-20:]:
+        total += pos["pnl_usd"]
+        print(f"  {pos['symbol']:<10} pnl {pos['pnl_usd']:+8.2f} | from {pos['origin_label']}"
+              f"{' (paper)' if pos['paper'] else ''} | {pos['token']}")
+    print(f"Total pnl: {total:+.2f} USDC")
+    if not CFG["live"] and CFG.get("paper_cash_usd"):
+        held = sum((pos["remaining_raw"] / 10**pos["decimals"]) * (token_info(pos["token"])["price"] or 0)
+                   for pos in STATE["positions"].values())
+        print(f"Paper bankroll: cash {fmt_usd(paper_cash())} + positions {fmt_usd(held)} = "
+              f"{fmt_usd(paper_cash() + held)} (started {fmt_usd(CFG['paper_cash_usd'])})")
+
+
+def cmd_payer(tx, wallet=None):
+    if wallet is None:
+        try:
+            rec = rpc("eth_getTransactionReceipt", [tx])
+            tracked = set(WALLETS)
+            wallet = next(("0x" + l["topics"][2][-40:] for l in rec["logs"] if l["topics"][0] == TRANSFER_TOPIC
+                           and len(l["topics"]) == 3 and "0x" + l["topics"][2][-40:] in tracked), None)
+        except Exception:
+            wallet = None
+    if wallet is None:
+        print("no tracked wallet received a token in this tx; pass the wallet as a second argument")
+        return
+    rec = relay_lookup(tx, wallet)
+    if rec is None:
+        print(f"Relay has no request for this tx yet ({WALLETS.get(wallet.lower(), wallet)})")
+        return
+    print(f"wallet {WALLETS.get(wallet.lower(), wallet)}  paired Solana {SOLANA.get(wallet.lower())}")
+    print(f"  referrer {rec['referrer']!r}  user {rec['user']}  recipient-match {rec['for_wallet']}  "
+          f"inTx chain {rec['in_chain']}  depositor {rec['depositor']}  app fees {rec['app_fees']}")
+    print(f"  -> {relay_judge(rec, wallet)}")
+
+
+def cmd_route(token):
+    info = token_info(token, fresh=True)
+    meta = token_meta(token)
+    print(f"{meta['symbol']} price ${info['price']} liquidity {fmt_usd(info['liquidity'])} "
+          f"buys/sells 24h {info['buys24']}/{info['sells24']}")
+    t0 = time.time()
+    lb, ls, desc, depth = discover_route(token)
+    amount_in = int(CFG["buy_usd"] * 10**USDC_DEC)
+    out, impact, rt = quote_check(lb, ls, amount_in)
+    back = quote_route(ls, out)
+    print(f"route: {desc} (depth {fmt_usd(depth)}) found in {time.time() - t0:.1f}s")
+    print(f"  price impact of {fmt_usd(CFG['buy_usd'])} vs a $1 probe: {impact:+.2%}   (bot skips above "
+          f"{CFG.get('max_price_impact_pct', 10)}%; round trip floor -{CFG.get('max_round_trip_loss_pct', 15)}%)")
+    print(f"  buy  {fmt_usd(CFG['buy_usd'])} -> {out / 10**meta['decimals']:,.6g} {meta['symbol']}"
+          f"  (implied ${CFG['buy_usd'] / (out / 10**meta['decimals']):.6g}, "
+          f"{(CFG['buy_usd'] / (out / 10**meta['decimals'])) / info['price'] - 1:+.2%} vs market)")
+    print(f"  sell back -> {fmt_usd(back / 10**USDC_DEC)} (round trip {back / amount_in - 1:+.2%})")
+    t0 = time.time()
+    head = int(rpc("eth_blockNumber", []), 16)
+    probe = holder_probe(token, ZERO, head)
+    why = bytecode_reason(token) or holder_probe_reason(probe)
+    print(f"  holders: {probe} in {time.time() - t0:.2f}s" + (f"  -> SKIP: {why}" if why else ""))
+    print("  legs_buy:", json.dumps(lb))
+
+
+def cmd_sell(what, pct=100):
+    """Sell part or all of an open position now (live), recording it like any
+    other exit. `what` is a token address or symbol."""
+    global SIGNER
+    match = [p for p in STATE["positions"].values()
+             if p["token"] == what.lower() or p["symbol"].lower() == what.lower()]
+    if not match:
+        sys.exit(f"no open position matching {what!r}; open: {[p['symbol'] for p in STATE['positions'].values()]}")
+    pos = match[0]
+    if not CFG["live"]:
+        sys.exit("config.live is false: nothing to sell on-chain")
+    SIGNER = Signer(ENV["PRIVATE_KEY"])
+    bal = balance_of(pos["token"], SIGNER.address)
+    raw = bal if pct >= 100 else int(pos["remaining_raw"] * pct / 100)
+    legs, quote = best_sell_legs(pos, raw)
+    print(f"{pos['symbol']}: selling {raw / 10**pos['decimals']:,.4g} ({pct}%) -> ~{fmt_usd(quote / 10**USDC_DEC)} USDC "
+          f"(min {fmt_usd(quote * (1 - SLIPPAGE) / 10**USDC_DEC)} after {SLIPPAGE:.0%} slippage)")
+    if input("send? [y/N] ").strip().lower() != "y":
+        print("aborted")
+        return
+    ensure_allowance(pos["token"], raw)
+    rec = swap_tx(legs, raw, int(quote * (1 - SLIPPAGE)))
+    got = received(rec, USDC) / 10**USDC_DEC
+    pos["remaining_raw"] = max(0, pos["remaining_raw"] - raw) if pct < 100 else 0
+    pos["usdc_out"] += got
+    pos["sells"].append({"ts": time.time(), "why": f"manual {pct}%", "raw": raw, "usd": got, "tx": rec["transactionHash"]})
+    append_jsonl("trades.jsonl", {"ts": time.time(), "side": "sell", "token": pos["token"], "symbol": pos["symbol"],
+                                  "usd": got, "raw": raw, "tx": rec["transactionHash"], "paper": False, "why": f"manual {pct}%"})
+    if pos["remaining_raw"] == 0:
+        pos.update(closed_at=time.time(), pnl_usd=pos["usdc_out"] - pos["buy_usd"], note="manual sell")
+        STATE["closed"].append(pos)
+        del STATE["positions"][pos["token"]]
+    save_state()
+    print(f"sold for {fmt_usd(got)} USDC, tx {rec['transactionHash']}")
+
+
+def cmd_holdings(wallet):
+    """Current non-dust ERC-20 holdings of a wallet (from recent Transfer logs)."""
+    head = int(rpc("eth_blockNumber", []), 16)
+    span = CFG.get("holdings_scan_blocks", 200_000)
+    seen = set()
+    for lg in logs_windowed({"topics": [TRANSFER_TOPIC, None, pad(wallet)]}, max(1, head - span), head):
+        seen.add(lg["address"].lower())
+    seen -= FUNDING_ADDRS
+    rows = []
+    for tok in seen:
+        try:
+            bal = balance_of(tok, wallet)
+        except Exception:
+            continue
+        if bal == 0:
+            continue
+        meta, info = token_meta(tok), token_info(tok)
+        amt = bal / 10**meta["decimals"]
+        rows.append((amt * (info["price"] or 0), meta["symbol"], amt, tok))
+        time.sleep(0.2)
+    for usd, sym, amt, tok in sorted(rows, reverse=True):
+        print(f"  {sym:<10} {amt:>16,.4g}  {fmt_usd(usd):>12}  {tok}")
+
+
+if __name__ == "__main__":
+    if hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(line_buffering=True)
+    args = sys.argv[1:]
+    if not args:
+        try:
+            cmd_run()
+        except KeyboardInterrupt:
+            save_state()
+            print("\nstopped; state saved", flush=True)
+            sys.exit(0)
+    elif args[0] == "status":
+        cmd_status()
+    elif args[0] == "route":
+        cmd_route(args[1])
+    elif args[0] == "payer":
+        cmd_payer(args[1], args[2] if len(args) > 2 else None)
+    elif args[0] == "holdings":
+        cmd_holdings(args[1])
+    elif args[0] == "sell":
+        cmd_sell(args[1], int(args[2]) if len(args) > 2 else 100)
+    elif args[0] == "adopt":
+        # bot.py adopt <token> <usd_spent> [unix_ts]: handed to the running bot via a command file
+        CMD_DIR.mkdir(parents=True, exist_ok=True)
+        (CMD_DIR / f"adopt_{args[1].lower()}.json").write_text(json.dumps(
+            {"action": "adopt", "token": args[1].lower(), "usd": float(args[2]),
+             "bought_at": float(args[3]) if len(args) > 3 else None, "ts": time.time()}))
+        print("adopt request written; the running bot picks it up on its next tick")
+    else:
+        sys.exit(__doc__)

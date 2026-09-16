@@ -1,0 +1,17 @@
+[Unit]
+Description=arc-copybot (Arc mainnet; paper or live per config.json)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+WorkingDirectory=/opt/arc-copybot
+ExecStart=/opt/arc-copybot/.venv/bin/python -u bot.py
+Restart=always
+RestartSec=5
+Environment=PYTHONUNBUFFERED=1
+KillSignal=SIGINT
+TimeoutStopSec=20
+MemoryMax=300M
+
+[Install]
+WantedBy=multi-user.target
