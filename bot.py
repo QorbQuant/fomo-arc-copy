@@ -772,9 +772,28 @@ class TxPending(Exception):
     """A transaction was broadcast but its receipt could not be fetched in
     time. The caller must NOT retry blindly: it may have been mined."""
 
-    def __init__(self, tx_hash):
+    def __init__(self, tx_hash, nonce=None, gas_price=None):
         super().__init__(f"tx {tx_hash} sent, receipt not seen yet")
         self.tx_hash = tx_hash
+        self.nonce = nonce
+        self.gas_price = gas_price
+
+
+def _broadcast_extra(raw):
+    """Also hand a signed tx to every endpoint in config "broadcast_rpcs" (Arc's public
+    node by default), in the background. On launch day Alchemy's Arc relay accepted a buy
+    and never forwarded it to the block producers: the public node had never heard of it
+    and it sat at a fee above every block's base fee until cancelled."""
+    extra = [u for u in dict.fromkeys(CFG.get("broadcast_rpcs", [])) if u and u != rpc_url()]
+
+    def go():
+        for u in extra:
+            try:
+                rpc("eth_sendRawTransaction", [raw], retries=1, url=u)
+            except Exception:
+                pass  # "already known" and friends: the primary's answer is the one that counts
+    if extra:
+        threading.Thread(target=go, daemon=True).start()
 
 
 def wait_receipt(tx_hash, seconds=90):
@@ -816,6 +835,7 @@ class Signer:
         raw = signed.raw_transaction.hex()
         h = "0x" + signed.hash.hex().removeprefix("0x")  # known before sending: lets us recover a lost response
         self.last_sent_ts = time.time()
+        _broadcast_extra("0x" + raw.removeprefix("0x"))
         try:
             rpc("eth_sendRawTransaction", ["0x" + raw.removeprefix("0x")], retries=1)
         except Exception as e:
@@ -835,12 +855,43 @@ class Signer:
                 self.last_nonce = int(rpc("eth_getTransactionCount", [self.address, "latest"]), 16) - 1
             raise
         self.last_nonce = nonce
-        rec = wait_receipt(h)
+        rec = wait_receipt(h, seconds=CFG.get("receipt_wait_s", 90))
         if rec is None:
-            raise TxPending(h)
+            raise TxPending(h, nonce, int(gp * 1.5))
         if int(rec["status"], 16) != 1:
             raise RuntimeError(f"tx {h} reverted")
         return rec
+
+    def cancel(self, nonce, old_gas_price, original_hash=None, wait_s=60):
+        """Replace a stuck transaction: a 0-value transfer to ourselves at the same nonce and at
+        least twice the price, broadcast everywhere. -> ("cancelled"|"original"|"unknown", receipt).
+        "original" means the stuck tx landed first after all (the caller must book it)."""
+        gp_now = int(rpc("eth_gasPrice", []), 16)
+        gp = max(int((old_gas_price or 0) * 2), gp_now * 2)
+        signed = self.acct.sign_transaction({"chainId": CHAIN_ID, "nonce": nonce, "to": self.address, "value": 0,
+                                             "data": "0x", "gas": 21000, "gasPrice": gp})
+        raw = "0x" + signed.raw_transaction.hex().removeprefix("0x")
+        h = "0x" + signed.hash.hex().removeprefix("0x")
+        _broadcast_extra(raw)
+        try:
+            rpc("eth_sendRawTransaction", [raw], retries=1)
+        except Exception as e:
+            if "nonce too low" not in str(e) and "already known" not in str(e):
+                log(f"  [warn] cancel of nonce {nonce} refused by the primary: {str(e)[:100]}")
+        deadline = time.time() + wait_s
+        while time.time() < deadline:
+            for kind, hh in (("original", original_hash), ("cancelled", h)):
+                if not hh:
+                    continue
+                try:
+                    rec = rpc("eth_getTransactionReceipt", [hh], retries=1)
+                except Exception:
+                    rec = None
+                if rec:
+                    self.last_nonce = max(self.last_nonce, nonce)
+                    return kind, rec
+            time.sleep(0.5)
+        return "unknown", None
 
 
 SIGNER = None
@@ -855,6 +906,23 @@ def ensure_allowance(token, amount):
     if cur < need:
         SIGNER.send(token, calldata("approve(address,uint256)", ["address", "uint256"], [addr(ROUTER), MAX_UINT]))
         log(f"  approved {token_meta(token)['symbol']} for router")
+
+
+def _resolve_stuck_buy(tp, symbol):
+    """A buy that is not in a block after receipt_wait_s must not be left floating: landing
+    minutes later it would buy a token no position tracks. Cancel it; if it lands first
+    anyway, return its receipt so the caller books the position."""
+    log(f"  [ALERT] {symbol}: buy tx {tp.tx_hash[:12]}.. not included in time; cancelling nonce {tp.nonce}")
+    kind, rec = SIGNER.cancel(tp.nonce, tp.gas_price, original_hash=tp.tx_hash)
+    if kind == "original" and int(rec["status"], 16) == 1:
+        log(f"  [buy] {symbol}: the original buy landed before the cancel; booking it")
+        return rec
+    if kind == "cancelled":
+        log(f"  [buy] {symbol}: stuck buy cancelled (nonce {tp.nonce} used by a 0-value self-transfer)")
+        return None
+    log(f"  [ALERT] {symbol}: neither the buy nor its cancel landed within 60s; check the wallet nonce "
+        f"(python bot.py cancel-pending)")
+    return None
 
 
 def swap_tx(legs, amount_in, min_out):
@@ -1498,7 +1566,12 @@ def handle_buy_signal(ev, tok, raw):
         if bal - CFG["buy_usd"] < reserve:
             return skip(f"USDC {fmt_usd(bal)} would leave less than the {fmt_usd(reserve)} gas reserve")
         try:
-            rec = swap_tx(legs_buy, amount_in, min_out)
+            try:
+                rec = swap_tx(legs_buy, amount_in, min_out)
+            except TxPending as tp:
+                rec = _resolve_stuck_buy(tp, meta["symbol"])
+                if rec is None:
+                    return skip(f"buy tx {tp.tx_hash[:12]}.. was not included within {CFG.get('receipt_wait_s', 90)}s; cancelled")
         except Exception as e:
             # a fast-moving pool (StockCat: $2.9K origin buy into $39K of liquidity) can move
             # past our 3% bound between the quote and the send. Re-quote once and retry,
@@ -1512,7 +1585,12 @@ def handle_buy_signal(ev, tok, raw):
                     return skip(f"buy tx failed: slippage, and a re-quote is {moved:+.1%} dearer than the signal-time quote")
                 min_out = int(quote2 * (1 - SLIPPAGE))
                 log(f"  [buy] {meta['symbol']}: slippage on the first send, re-quoted {moved:+.1%} and retrying")
-                rec = swap_tx(legs_buy, amount_in, min_out)
+                try:
+                    rec = swap_tx(legs_buy, amount_in, min_out)
+                except TxPending as tp:
+                    rec = _resolve_stuck_buy(tp, meta["symbol"])
+                    if rec is None:
+                        return skip(f"re-quoted buy tx {tp.tx_hash[:12]}.. not included; cancelled")
                 sig["requoted"] = round(moved, 4)
             except Exception as e2:
                 return skip(f"buy tx failed after re-quote: {e2}")
@@ -2480,6 +2558,30 @@ def cmd_deploy_router():
     print(f'next: put "router": "{router}" into config.json')
 
 
+def cmd_cancel_pending():
+    """Cancel the lowest stuck transaction of the hot wallet (pending nonce above the mined
+    one on any endpoint) with a 0-value self-transfer at a higher price."""
+    global SIGNER
+    SIGNER = _signer_from_env()
+    urls = list(dict.fromkeys([RPC_URL] + CFG.get("broadcast_rpcs", [])))
+    mined = int(rpc("eth_getTransactionCount", [SIGNER.address, "latest"]), 16)
+    pending = {u: int(rpc("eth_getTransactionCount", [SIGNER.address, "pending"], url=u), 16) for u in urls}
+    print(f"wallet {SIGNER.address}: mined nonce {mined}; pending by endpoint "
+          + ", ".join(f"{u.split('/')[2]} {n}" for u, n in pending.items()))
+    if all(n <= mined for n in pending.values()):
+        print("nothing pending")
+        return
+    if "--yes" not in sys.argv and input(f"cancel nonce {mined}? [y/N] ").strip().lower() != "y":
+        sys.exit("cancelled")
+    kind, rec = SIGNER.cancel(mined, int(rpc("eth_gasPrice", []), 16) * 2, wait_s=90)
+    if rec:
+        print(f"{kind}: {rec['transactionHash']} in block {int(rec['blockNumber'], 16)}, "
+              f"fee {int(rec['gasUsed'], 16) * int(rec.get('effectiveGasPrice', '0x0'), 16) / 1e18:.5f} USDC")
+    else:
+        print("the replacement was not mined within 90s")
+    print(f"mined nonce now {int(rpc('eth_getTransactionCount', [SIGNER.address, 'latest']), 16)}")
+
+
 def cmd_sell(what, pct=100):
     """Sell part or all of an open position now (live), recording it like any
     other exit. `what` is a token address or symbol."""
@@ -2559,6 +2661,8 @@ if __name__ == "__main__":
         cmd_wallet()
     elif args[0] == "deploy-router":
         cmd_deploy_router()
+    elif args[0] == "cancel-pending":
+        cmd_cancel_pending()
     elif args[0] == "payer":
         cmd_payer(args[1], args[2] if len(args) > 2 else None)
     elif args[0] == "holdings":
