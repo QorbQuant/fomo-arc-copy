@@ -155,6 +155,8 @@ def snapshot():
                                   ("retrying sell" if pos.get("retry_after", 0) > time.time() else
                                    ("no price" if unknown else "")))})
         closed = st["closed"]
+        if cfg.get("live", False):
+            closed = [c for c in closed if not c.get("paper")]  # dry-run trades from before going live
         realized = sum(c.get("pnl_usd", 0) for c in closed)
         wins = sum(1 for c in closed if c.get("pnl_usd", 0) > 0)
         stats = trade_stats(closed, rows)
