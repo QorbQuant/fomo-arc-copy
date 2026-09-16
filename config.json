@@ -77,5 +77,6 @@
   "gas_reserve_usdc": 3.0,
   "critical_usdc": 1.0,
   "heartbeat_seconds": 120,
-  "_rpc_note": "tuned for the dedicated Alchemy Arc endpoint (no 10-block getLogs cap, ~15 ms calls); on the public node use poll_seconds 2 and holder_probe_wait_s 3"
+  "_rpc_note": "tuned for the dedicated Alchemy Arc endpoint (no 10-block getLogs cap, ~15 ms calls); on the public node use poll_seconds 2 and holder_probe_wait_s 3",
+  "wallet": "0xC48328a4C4e6090bf7d5a603cAb6C62a7b7D418b"
 }

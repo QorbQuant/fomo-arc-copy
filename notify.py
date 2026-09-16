@@ -119,8 +119,8 @@ def view_status():
         if inst["live"]:
             eq = (inst["cash"] or 0) + inst["positions_value"]
             out.append(f"LIVE  cash {dash.money(inst['cash'])} + pos {dash.money(inst['positions_value'])} = {dash.money(eq)}")
-            if inst.get("gas") is not None:
-                out.append(f"      gas {inst['gas']:.4f} ETH" + ("  LOW!" if inst["gas"] < inst["min_gas"] else ""))
+            if inst.get("low"):
+                out.append("      USDC LOW! it also pays gas; sells will fail")
         else:
             eq = (inst["cash"] or 0) + inst["positions_value"]
             out.append(f"PAPER {dash.money(eq)} of {dash.money(inst['start'])}")

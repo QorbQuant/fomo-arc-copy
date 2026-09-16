@@ -159,11 +159,14 @@ def snapshot():
         wins = sum(1 for c in closed if c.get("pnl_usd", 0) > 0)
         stats = trade_stats(closed, rows)
         live = cfg.get("live", False)
-        cash, gas = None, None
+        cash, low = None, False
         if live:
-            # the deploy owner is the hot wallet; read it from the router's owner is overkill — use env-free RPC on config wallet if present
-            wallet = cfg.get("wallet") or "0xBf4777C71D2dbE842c36621C446C6F2b64f87233"
-            cash, gas = usdc_balance(wallet)
+            # the hot wallet's public address lives in config.json "wallet" (the key stays in .env)
+            wallet = cfg.get("wallet")
+            if wallet:
+                cash, _native = usdc_balance(wallet)
+                # on Arc gas is paid from this same USDC balance: low cash means sells will fail
+                low = cash is not None and cash < cfg.get("critical_usdc", 1.0)
         else:
             cash = st.get("paper_cash", cfg.get("paper_cash_usd"))
         positions_value = sum(r["held"] for r in rows)
@@ -172,7 +175,7 @@ def snapshot():
             "n_closed": len(closed), "wins": wins, "realized": realized, "unreal": unreal,
             "deployed": sum(r["in"] - r["sold"] for r in rows), "cash": cash, "positions_value": positions_value,
             "start": cfg.get("paper_cash_usd"), "signals": sigs[-12:][::-1],
-            "gas": gas, "min_gas": cfg.get("min_gas_eth", 0.003), "stats": stats,
+            "low": low, "reserve": cfg.get("gas_reserve_usdc", 3.0), "stats": stats,
             "n_sig": n_all, "n_bought": n_bought,
         })
     return snap
@@ -235,9 +238,8 @@ def lines_for(inst, width, selected=None):
     if inst["live"]:
         equity = (inst["cash"] or 0) + inst["positions_value"]
         hdr += f"wallet USDC {money(inst['cash'])} + positions {money(inst['positions_value'])} = {money(equity)}"
-        if inst.get("gas") is not None:
-            low = inst["gas"] < inst["min_gas"]
-            hdr += f"   |  gas {inst['gas']:.4f} ETH" + ("  ⚠ LOW — top up, sells are failing" if low else "")
+        if inst.get("low"):
+            hdr += "   |  ⚠ USDC LOW — it also pays gas; sells will fail until topped up"
     else:
         equity = (inst["cash"] or 0) + inst["positions_value"]
         hdr += (f"bankroll {money(equity)} of {money(inst['start'])} start  "

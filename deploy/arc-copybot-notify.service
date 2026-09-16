@@ -1,0 +1,15 @@
+[Unit]
+Description=arc-copybot Telegram notifier (separate process; never touches the bot)
+After=network-online.target arc-copybot.service
+
+[Service]
+WorkingDirectory=/opt/arc-copybot
+Environment=BOT_UNIT=arc-copybot
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/opt/arc-copybot/.venv/bin/python -u notify.py
+Restart=always
+RestartSec=10
+MemoryMax=200M
+
+[Install]
+WantedBy=multi-user.target

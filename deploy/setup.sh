@@ -14,7 +14,10 @@ else
 fi
 mkdir -p data
 install -m 644 deploy/arc-copybot.service /etc/systemd/system/arc-copybot.service
+install -m 644 deploy/arc-copybot-notify.service /etc/systemd/system/arc-copybot-notify.service
 systemctl daemon-reload
 systemctl enable arc-copybot >/dev/null
+# the notifier only runs once its own Telegram bot token is in .env
+if grep -q "^TELEGRAM_BOT_TOKEN=." .env 2>/dev/null; then systemctl enable arc-copybot-notify >/dev/null; fi
 echo "installed. start with:  systemctl start arc-copybot"
 echo "logs:                   journalctl -fu arc-copybot"
