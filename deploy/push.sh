@@ -29,7 +29,7 @@ else
   EXCL=(); echo "first deploy: seeding data/ and .env from this laptop"
 fi
 rsync -az --delete --exclude .venv --exclude __pycache__ --exclude .git --exclude contracts/out --exclude contracts/cache \
-  "${EXCL[@]}" "$HERE/" "$HOST:$REMOTE/"
+  ${EXCL[@]+"${EXCL[@]}"} "$HERE/" "$HOST:$REMOTE/"
 ssh "$HOST" "chmod +x $REMOTE/deploy/setup.sh && $REMOTE/deploy/setup.sh"
 echo
 echo "next:  ssh $HOST 'systemctl restart arc-copybot && journalctl -fu arc-copybot'"
