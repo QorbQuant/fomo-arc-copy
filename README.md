@@ -86,6 +86,8 @@ python bot.py                 # paper mode: config.json ships with "live": false
 | `python bot.py status` | open/closed positions and PnL |
 | `python bot.py route <token>` | route, quotes, price impact and the holder-probe verdict |
 | `python bot.py payer <txhash> [wallet]` | Relay's record for a fill and the verdict |
+| `python bot.py wallet` | hot wallet address, USDC balance and router |
+| `python bot.py deploy-router` | deploy CopyRouter from the hot wallet and verify its code and wiring |
 | `python bot.py holdings <wallet>` | what a wallet holds |
 | `python bot.py sell <symbol> [pct]` / `adopt <token> <usd>` | manual exit / take over an orphaned bag |
 | `python tools/simulate_router.py <token> …` | runs CopyRouter buys and sells against real Arc state with nothing deployed (see below) |
@@ -152,8 +154,11 @@ rh-copybot's values, which were measured on Robinhood Chain. Re-check them again
 
 1. Enable Arc mainnet on a dedicated Alchemy app and put its URL in `.env`.
 2. Paper-trade for a day and compare the bot's would-be buys with circletrenches.com's labels.
-3. Fund the hot wallet with USDC (gas included), `forge build --root contracts`, then
-   `./deploy.sh`; put the printed address into `config.json` → `router`.
+3. Fund the hot wallet with USDC (gas included) and save its key into the droplet's `.env`,
+   then run `python bot.py deploy-router` there (no Foundry needed: the creation bytecode is
+   committed in `contracts/CopyRouter.creation.hex`, built from `contracts/src/CopyRouter.sol`
+   with solc 0.8.36). Put the printed address into `config.json` → `router`. `./deploy.sh`
+   does the same from a laptop with Foundry.
 4. `python tools/simulate_router.py` on a few current tokens once more, then `"live": true`.
 
 ## Running on the droplet

@@ -15,6 +15,8 @@ Usage:
   python bot.py status          open/closed positions + PnL
   python bot.py route <token>   dry-run route discovery + quote for one token
   python bot.py payer <txhash>  Relay's record for a fill and the verdict
+  python bot.py wallet          hot wallet address, USDC balance, router
+  python bot.py deploy-router   deploy CopyRouter from the hot wallet and verify it
   python bot.py holdings <addr> what a watched wallet holds right now
   python bot.py sell <token|symbol> [pct]   sell an open position now (asks to confirm)
   python bot.py adopt <token> <usd_spent>   register tokens the wallet holds but the bot lost track of
@@ -2414,6 +2416,70 @@ def cmd_route(token):
     print("  legs_buy:", json.dumps(lb))
 
 
+def _signer_from_env():
+    key = ENV.get("PRIVATE_KEY")
+    if not key:
+        sys.exit("PRIVATE_KEY missing from .env")
+    return Signer(key)
+
+
+def cmd_wallet():
+    """Hot wallet address and balance. The key never leaves .env and is never printed."""
+    signer = _signer_from_env()
+    usdc = balance_of(USDC, signer.address) / 10**USDC_DEC
+    nonce = int(rpc("eth_getTransactionCount", [signer.address, "latest"]), 16)
+    print(f"wallet   {signer.address}")
+    print(f"USDC     {usdc:,.2f}  (this also pays gas; {fmt_usd(CFG.get('gas_reserve_usdc', 3.0))} is kept back)")
+    print(f"txs sent {nonce}")
+    print(f"router   {ROUTER or '(not deployed yet: python bot.py deploy-router)'}")
+
+
+def cmd_deploy_router():
+    """Deploy CopyRouter from the hot wallet in .env, wired to Uniswap's official Arc
+    SwapRouter02 and V4 PoolManager, then verify the deployed code and its wiring.
+    Bytecode: contracts/CopyRouter.creation.hex, built from contracts/src/CopyRouter.sol."""
+    global SIGNER
+    SIGNER = _signer_from_env()
+    if ROUTER:
+        sys.exit(f"config.json already has router {ROUTER}; clear it first if you really want another")
+    hexfile = Path(__file__).resolve().parent / "contracts" / "CopyRouter.creation.hex"
+    creation = hexfile.read_text().strip()
+    data = creation + encode(["address", "address"], [addr(SWAP_ROUTER02), addr(POOL_MANAGER)]).hex()
+    usdc = balance_of(USDC, SIGNER.address) / 10**USDC_DEC
+    tx = {"from": SIGNER.address, "data": data}
+    gas_hex, gp_hex = rpc_batch([("eth_estimateGas", [tx]), ("eth_gasPrice", [])])
+    gas, gp = int(int(gas_hex, 16) * 1.3), int(int(gp_hex, 16) * 1.5)
+    cost = gas * gp / 1e18
+    print(f"deployer {SIGNER.address}  USDC {usdc:,.2f}")
+    print(f"deploy gas limit {gas:,} at {gp / 1e9:.1f} gwei -> at most {cost:.4f} USDC")
+    if usdc < cost:
+        sys.exit("not enough USDC for gas yet")
+    if "--yes" not in sys.argv and input("deploy CopyRouter now? [y/N] ").strip().lower() != "y":
+        sys.exit("cancelled")
+    nonce = int(rpc("eth_getTransactionCount", [SIGNER.address, "pending"]), 16)
+    signed = SIGNER.acct.sign_transaction({"chainId": CHAIN_ID, "nonce": nonce, "data": data, "value": 0,
+                                           "gas": gas, "gasPrice": gp, "to": b""})
+    h = "0x" + signed.hash.hex().removeprefix("0x")
+    rpc("eth_sendRawTransaction", ["0x" + signed.raw_transaction.hex().removeprefix("0x")], retries=1)
+    print(f"sent {h}, waiting for the receipt...")
+    rec = wait_receipt(h, seconds=120)
+    if rec is None or int(rec["status"], 16) != 1 or not rec.get("contractAddress"):
+        sys.exit(f"deploy did not succeed: {rec and rec.get('status')}")
+    router = to_checksum_address(rec["contractAddress"])
+    code = rpc("eth_getCode", [router, "latest"])
+    wired_sr = "0x" + rpc("eth_call", [{"to": router, "data": "0x" + selector("swapRouter()").hex()}, "latest"])[-40:]
+    wired_pm = "0x" + rpc("eth_call", [{"to": router, "data": "0x" + selector("poolManager()").hex()}, "latest"])[-40:]
+    owner = "0x" + rpc("eth_call", [{"to": router, "data": "0x" + selector("owner()").hex()}, "latest"])[-40:]
+    ok = (len(code) > 2 and wired_sr.lower() == SWAP_ROUTER02.lower() and wired_pm.lower() == POOL_MANAGER.lower()
+          and owner.lower() == SIGNER.address.lower())
+    print(f"router   {router}  code {(len(code) - 2) // 2} bytes  wiring {'OK' if ok else 'WRONG'}  "
+          f"gas paid {int(rec['gasUsed'], 16) * int(rec.get('effectiveGasPrice', hex(gp)), 16) / 1e18:.4f} USDC")
+    print(f"explorer https://explorer.arc.io/address/{router}")
+    if not ok:
+        sys.exit("wiring check failed: do not use this router")
+    print(f'next: put "router": "{router}" into config.json')
+
+
 def cmd_sell(what, pct=100):
     """Sell part or all of an open position now (live), recording it like any
     other exit. `what` is a token address or symbol."""
@@ -2489,6 +2555,10 @@ if __name__ == "__main__":
         cmd_status()
     elif args[0] == "route":
         cmd_route(args[1])
+    elif args[0] == "wallet":
+        cmd_wallet()
+    elif args[0] == "deploy-router":
+        cmd_deploy_router()
     elif args[0] == "payer":
         cmd_payer(args[1], args[2] if len(args) > 2 else None)
     elif args[0] == "holdings":
