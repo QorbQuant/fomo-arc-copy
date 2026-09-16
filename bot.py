@@ -779,21 +779,49 @@ class TxPending(Exception):
         self.gas_price = gas_price
 
 
-def _broadcast_extra(raw):
-    """Also hand a signed tx to every endpoint in config "broadcast_rpcs" (Arc's public
-    node by default), in the background. On launch day Alchemy's Arc relay accepted a buy
-    and never forwarded it to the block producers: the public node had never heard of it
-    and it sat at a fee above every block's base fee until cancelled."""
-    extra = [u for u in dict.fromkeys(CFG.get("broadcast_rpcs", [])) if u and u != rpc_url()]
+_OK_DUP = ("already known", "known transaction", "already exists", "already imported")
 
-    def go():
-        for u in extra:
+
+def broadcast(raw):
+    """Send a signed tx to the primary RPC AND every config "broadcast_rpcs" endpoint at once,
+    retrying rate-limit refusals, and wait for their answers. On Arc's launch day Alchemy's
+    relay accepted two of our first four txs (a buy, then an approval) and never forwarded
+    them; each mined within a block once Arc's public node had it. Accepted by any endpoint
+    = sent. If none accepts, raise the most informative error (nonce too low, revert, ...)."""
+    urls = list(dict.fromkeys([rpc_url()] + [u for u in CFG.get("broadcast_rpcs", []) if u]))
+    answers = {}
+
+    def one(u):
+        for attempt in range(4):
             try:
-                rpc("eth_sendRawTransaction", [raw], retries=1, url=u)
-            except Exception:
-                pass  # "already known" and friends: the primary's answer is the one that counts
-    if extra:
-        threading.Thread(target=go, daemon=True).start()
+                r = _s.post(u, json={"jsonrpc": "2.0", "id": 1, "method": "eth_sendRawTransaction", "params": [raw]},
+                            timeout=10)
+                body = r.json() if r.status_code != 429 else {"error": {"code": 429, "message": "rate limit"}}
+            except Exception as e:
+                body = {"error": {"message": f"{type(e).__name__}: {str(e)[:80]}"}}
+            err = body.get("error")
+            if err and _rate_limited(err) and attempt < 3:
+                time.sleep(0.4 * (attempt + 1))
+                continue
+            answers[u] = body
+            return
+    threads = [threading.Thread(target=one, args=(u,), daemon=True) for u in urls]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(8)
+    ok = [u for u, b in answers.items() if "result" in b or any(k in json.dumps(b.get("error", "")).lower() for k in _OK_DUP)]
+    bad = {u: b.get("error") for u, b in answers.items() if u not in ok}
+    for u in urls:
+        if u not in answers:
+            bad[u] = {"message": "no answer"}
+    if bad and ok:
+        log(f"  [tx] accepted by {', '.join(x.split('/')[2] for x in ok)}; refused by "
+            + ", ".join(f"{x.split('/')[2]} ({json.dumps(e)[:90]})" for x, e in bad.items()))
+    if not ok:
+        msgs = [json.dumps(e) for e in bad.values()]
+        best = next((m for m in msgs if "nonce" in m.lower() or "revert" in m.lower() or "insufficient" in m.lower()), msgs[0])
+        raise RuntimeError(f"eth_sendRawTransaction: {best[:200]}")
 
 
 def wait_receipt(tx_hash, seconds=90):
@@ -835,9 +863,8 @@ class Signer:
         raw = signed.raw_transaction.hex()
         h = "0x" + signed.hash.hex().removeprefix("0x")  # known before sending: lets us recover a lost response
         self.last_sent_ts = time.time()
-        _broadcast_extra("0x" + raw.removeprefix("0x"))
         try:
-            rpc("eth_sendRawTransaction", ["0x" + raw.removeprefix("0x")], retries=1)
+            broadcast("0x" + raw.removeprefix("0x"))
         except Exception as e:
             msg = str(e)
             # The node may have accepted the tx even though our response was lost; a
@@ -872,9 +899,8 @@ class Signer:
                                              "data": "0x", "gas": 21000, "gasPrice": gp})
         raw = "0x" + signed.raw_transaction.hex().removeprefix("0x")
         h = "0x" + signed.hash.hex().removeprefix("0x")
-        _broadcast_extra(raw)
         try:
-            rpc("eth_sendRawTransaction", [raw], retries=1)
+            broadcast(raw)
         except Exception as e:
             if "nonce too low" not in str(e) and "already known" not in str(e):
                 log(f"  [warn] cancel of nonce {nonce} refused by the primary: {str(e)[:100]}")
@@ -2538,7 +2564,7 @@ def cmd_deploy_router():
     signed = SIGNER.acct.sign_transaction({"chainId": CHAIN_ID, "nonce": nonce, "data": data, "value": 0,
                                            "gas": gas, "gasPrice": gp, "to": b""})
     h = "0x" + signed.hash.hex().removeprefix("0x")
-    rpc("eth_sendRawTransaction", ["0x" + signed.raw_transaction.hex().removeprefix("0x")], retries=1)
+    broadcast("0x" + signed.raw_transaction.hex().removeprefix("0x"))
     print(f"sent {h}, waiting for the receipt...")
     rec = wait_receipt(h, seconds=120)
     if rec is None or int(rec["status"], 16) != 1 or not rec.get("contractAddress"):
