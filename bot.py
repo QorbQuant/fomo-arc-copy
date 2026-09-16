@@ -1564,7 +1564,7 @@ def handle_buy_signal(ev, tok, raw):
         lat_s = (f"latency {lat['total']:.1f}s = detect {lat['detect']:.1f} + route {lat['route']:.1f} "
                  f"+ send {lat['send']:.1f} + mine {lat['mine']:.1f} ({lat['blocks_behind']} blocks behind)")
     else:
-        lat_s = f"signal age {age:.1f}s, route {t_route - t_detect:.1f}s"
+        lat_s = f"signal age {sig['signal_age_s']:.1f}s, pool {age if age is not None else '?'} min old, route {t_route - t_detect:.1f}s"
     log(f"  [BUY{'' if CFG['live'] else ' paper'}] {meta['symbol']} {fmt_usd(CFG['buy_usd'])} "
         f"<- {sig['label']} bought {fmt_usd(origin_usd)} | {desc} | {lat_s}")
 
