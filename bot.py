@@ -597,7 +597,6 @@ def logs_windowed(flt, from_b, to_b, span=None, url=None, newest_first=False, st
     """eth_getLogs over a block range in windows the node accepts (Arc's public node caps a
     query at 10,000 blocks even when it is address- and topic-filtered)."""
     span = span or CFG.get("log_window_blocks", 5000)
-    url = url or FALLBACK_RPC
     out = []
     windows = [(lo, min(lo + span - 1, to_b)) for lo in range(from_b, to_b + 1, span)]
     for lo, hi in (reversed(windows) if newest_first else windows):
@@ -995,7 +994,7 @@ def recent_holders(token, upto_block, exclude, lookback, count, min_age_blocks):
     the contracts. Recipients younger than `min_age_blocks` are left out: a blacklisting
     operator has not processed them yet, so they prove nothing."""
     logs = rpc("eth_getLogs", [{"fromBlock": hex(max(0, upto_block - lookback)), "toBlock": hex(upto_block),
-                                "address": token, "topics": [TRANSFER_TOPIC]}], retries=2, url=FALLBACK_RPC)
+                                "address": token, "topics": [TRANSFER_TOPIC]}], retries=2)
     out = []
     for lg in reversed(logs):
         if len(lg["topics"]) != 3:

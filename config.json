@@ -6,7 +6,7 @@
   "fallback_rpc": "https://rpc.mainnet.arc.io",
   "dexscreener_chain": "arc",
   "blocks_per_second": 1.98,
-  "poll_seconds": 2.0,
+  "poll_seconds": 0.5,
   "buy_usd": 100,
   "max_positions": 50,
   "min_liquidity_usd": 10000,
@@ -29,7 +29,7 @@
   "sell_retry_seconds": 300,
   "holdings_scan_blocks": 200000,
   "exclude_tokens": [],
-  "log_chunk_blocks": 10,
+  "log_chunk_blocks": 40,
   "max_catchup_blocks": 240,
   "max_round_trip_loss_pct": 15,
   "thin_liquidity_usd": 50000,
@@ -59,7 +59,7 @@
   "holder_probe_count": 8,
   "holder_probe_min_age_s": 30,
   "holder_probe_lookback_blocks": 1200,
-  "holder_probe_wait_s": 3.0,
+  "holder_probe_wait_s": 1.0,
   "holder_probe_min_trapped": 2,
   "holder_probe_pool_counts": false,
   "relay_gate": true,
@@ -77,5 +77,5 @@
   "gas_reserve_usdc": 3.0,
   "critical_usdc": 1.0,
   "heartbeat_seconds": 120,
-  "_rpc_note": "poll_seconds 2 suits Arc's public node; with a dedicated Alchemy endpoint drop it to 0.5"
+  "_rpc_note": "tuned for the dedicated Alchemy Arc endpoint (no 10-block getLogs cap, ~15 ms calls); on the public node use poll_seconds 2 and holder_probe_wait_s 3"
 }

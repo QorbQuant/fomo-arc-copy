@@ -68,9 +68,11 @@ python bot.py                 # paper mode: config.json ships with "live": false
 ```
 
 - **RPC.** Use this bot's own endpoint, never the scanner's. Alchemy serves Arc mainnet as
-  `https://arc-mainnet.g.alchemy.com/v2/<KEY>`; the network has to be enabled on the Alchemy
-  app first. With a dedicated endpoint, drop `poll_seconds` to 0.5 and `holder_probe_wait_s`
-  to 1. The public node (`https://rpc.mainnet.arc.io`) works for paper mode at 2s polls.
+  `https://arc-mainnet.g.alchemy.com/v2/<KEY>` once Arc is enabled on the app. Measured from
+  the droplet: no 10-block log cap (10,000-block ranges answer, 20,000 results max), ~15 ms
+  calls, 40-call batches with no refusals, working WSS and `eth_simulateV1`. The config is
+  tuned for it (0.5 s polls). On the public node (`https://rpc.mainnet.arc.io`) use
+  `poll_seconds` 2 and `holder_probe_wait_s` 3.
 - **Wallets.** `wallets.json` holds the 147 traders from the scanner's `traders.json`;
   `solana.json` maps each to its paired Solana wallet (146 of 147).
 - **Every batched RPC item that comes back refused for rate limiting is resent on its own.**

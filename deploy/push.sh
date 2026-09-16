@@ -23,10 +23,12 @@ rm -rf "$TMP"
 ssh "$HOST" "mkdir -p $REMOTE"
 # The droplet's data/ (positions, logs) and .env (keys) are the live truth once
 # deployed: NEVER overwrite them on an update. Only the very first push seeds them.
-if ssh "$HOST" "test -f $REMOTE/data/state.json"; then
-  EXCL=(--exclude data --exclude .env); echo "update: leaving the droplet's data/ and .env untouched"
-else
-  EXCL=(); echo "first deploy: seeding data/ and .env from this laptop"
+EXCL=()
+if ssh "$HOST" "test -f $REMOTE/.env"; then
+  EXCL+=(--exclude .env); echo "leaving the droplet's .env untouched"
+fi
+if ssh "$HOST" "test -d $REMOTE/data"; then
+  EXCL+=(--exclude data); echo "leaving the droplet's data/ untouched"
 fi
 rsync -az --delete --exclude .venv --exclude __pycache__ --exclude .git --exclude contracts/out --exclude contracts/cache \
   ${EXCL[@]+"${EXCL[@]}"} "$HERE/" "$HOST:$REMOTE/"
